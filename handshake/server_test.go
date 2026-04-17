@@ -63,7 +63,7 @@ func TestVirtualPacketConnReadDeadline(t *testing.T) {
 	}
 	defer parent.Close()
 
-	v := newVirtualPacketConn(parent)
+	v := newVirtualPacketConn(parent, make(chan AuthDatagram, 8))
 	defer v.Close()
 
 	if err := v.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
@@ -91,7 +91,7 @@ func TestVirtualPacketConnReadFromChannel(t *testing.T) {
 	}
 	defer parent.Close()
 
-	v := newVirtualPacketConn(parent)
+	v := newVirtualPacketConn(parent, make(chan AuthDatagram, 8))
 	defer v.Close()
 
 	addr := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 4242}

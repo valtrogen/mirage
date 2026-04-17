@@ -153,6 +153,99 @@ func TestKeyringConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
+func TestKeyringSetAcceptsExtraKey(t *testing.T) {
+	primary := make([]byte, 32)
+	if _, err := rand.Read(primary); err != nil {
+		t.Fatalf("rand primary: %v", err)
+	}
+	old := make([]byte, 32)
+	if _, err := rand.Read(old); err != nil {
+		t.Fatalf("rand old: %v", err)
+	}
+	k, err := NewKeyringSet(primary, old)
+	if err != nil {
+		t.Fatalf("NewKeyringSet: %v", err)
+	}
+	wid := replay.CurrentWindowID()
+	// Encode a session id under the *old* key.
+	wkeyOld, err := replay.DeriveWindowKey(old, wid)
+	if err != nil {
+		t.Fatalf("derive old: %v", err)
+	}
+	sid := make([]byte, proto.SessionIDLen)
+	if err := EncodeSessionID(sid, wkeyOld, []byte("87654321"), wid); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	short, gotWid, err := k.Verify(sid)
+	if err != nil {
+		t.Fatalf("Verify(sid encoded under extra key): %v", err)
+	}
+	if gotWid != wid {
+		t.Fatalf("wid mismatch: got %d want %d", gotWid, wid)
+	}
+	if !bytes.Equal(short, []byte("87654321")) {
+		t.Fatalf("short %q", short)
+	}
+}
+
+func TestKeyringRotateKeysSwapsPrimary(t *testing.T) {
+	a := make([]byte, 32)
+	b := make([]byte, 32)
+	rand.Read(a)
+	rand.Read(b)
+	k, err := NewKeyringSet(a)
+	if err != nil {
+		t.Fatalf("NewKeyringSet: %v", err)
+	}
+	if err := k.RotateKeys(b, a); err != nil {
+		t.Fatalf("RotateKeys: %v", err)
+	}
+	wid := replay.CurrentWindowID()
+
+	// New session encoded under the *new* primary must verify.
+	wkeyNew, _ := replay.DeriveWindowKey(b, wid)
+	sidNew := make([]byte, proto.SessionIDLen)
+	if err := EncodeSessionID(sidNew, wkeyNew, []byte("87654321"), wid); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, _, err := k.Verify(sidNew); err != nil {
+		t.Fatalf("verify new: %v", err)
+	}
+	// Old session encoded under the *previous* primary (now an extra)
+	// must still verify.
+	wkeyOld, _ := replay.DeriveWindowKey(a, wid)
+	sidOld := make([]byte, proto.SessionIDLen)
+	if err := EncodeSessionID(sidOld, wkeyOld, []byte("12345678"), wid); err != nil {
+		t.Fatalf("encode old: %v", err)
+	}
+	if _, _, err := k.Verify(sidOld); err != nil {
+		t.Fatalf("verify old after rotation: %v", err)
+	}
+}
+
+func TestKeyringRotateKeysDropsRetiredKey(t *testing.T) {
+	a := make([]byte, 32)
+	b := make([]byte, 32)
+	rand.Read(a)
+	rand.Read(b)
+	k, err := NewKeyringSet(a)
+	if err != nil {
+		t.Fatalf("NewKeyringSet: %v", err)
+	}
+	if err := k.RotateKeys(b); err != nil {
+		t.Fatalf("RotateKeys: %v", err)
+	}
+	wid := replay.CurrentWindowID()
+	wkeyOld, _ := replay.DeriveWindowKey(a, wid)
+	sid := make([]byte, proto.SessionIDLen)
+	if err := EncodeSessionID(sid, wkeyOld, []byte("87654321"), wid); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, _, err := k.Verify(sid); err == nil {
+		t.Fatal("expected Verify to reject session under retired key")
+	}
+}
+
 func TestKeyringRejectsBadMasterKey(t *testing.T) {
 	if _, err := NewKeyring(make([]byte, 31)); err == nil {
 		t.Fatal("want error for 31-byte master key")

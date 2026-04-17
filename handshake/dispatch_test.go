@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/valtrogen/mirage/adapter"
+	"github.com/valtrogen/mirage/metrics"
 	"github.com/valtrogen/mirage/proto"
 	"github.com/valtrogen/mirage/replay"
 	"github.com/valtrogen/mirage/transport"
@@ -262,6 +263,52 @@ func TestDispatcherReapsIdleSessions(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("session was not reaped after TTL")
+}
+
+func TestDispatcherAuthQueueOverflowIsNonBlocking(t *testing.T) {
+	mk := make([]byte, 32)
+	rand.Read(mk)
+
+	d, server := newDispatcherForTest(t, mk)
+	defer server.Close()
+	d.AuthSink = make(chan AuthDatagram, 1) // intentionally tiny
+	d.InitialRatePerSec = -1                // disable rate limiter for this test
+	d.Metrics = metrics.NewMemorySink()     // OverflowCount needs a real counter
+	if err := d.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer d.Close()
+
+	dcid := bytes.Repeat([]byte{0xD1}, 8)
+	pkt := buildAuthInitial(t, d.Keyring, []byte("87654321"), dcid, 1)
+
+	client, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer client.Close()
+	target := server.LocalAddr().(*net.UDPAddr)
+
+	// First packet creates the session and slots into the cap-1 queue.
+	// Subsequent packets from the same 4-tuple hit the cached session
+	// and try to deliverAuthAllowDrain again: queue is full and nobody
+	// is reading, so they must overflow non-blockingly.
+	for i := 0; i < 64; i++ {
+		if _, err := client.WriteToUDP(pkt, target); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if d.OverflowCount() > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := d.OverflowCount(); got == 0 {
+		t.Fatal("expected at least one auth_queue_overflow")
+	}
 }
 
 func TestDispatcherRequiresFields(t *testing.T) {
