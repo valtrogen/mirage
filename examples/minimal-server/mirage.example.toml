@@ -1,0 +1,43 @@
+# mirage server configuration. Copy to /etc/mirage/mirage.toml and edit.
+# Replace the marked secrets before deploying.
+
+listen     = "0.0.0.0:443"
+master_key = "REPLACE_WITH_64_HEX_CHARACTERS_REPLACE_WITH_64_HEX_CHARACTERS_00"
+# additional_master_keys = ["..."]            # for make-before-break rotation
+
+tls_cert = "/etc/mirage/cert.pem"
+tls_key  = "/etc/mirage/key.pem"
+
+session_ttl      = "5m"
+auth_queue_depth = 256
+drain            = "10s"
+
+# Per-source-IP token bucket gating *unauthenticated* Initials.
+# 0 = use dispatcher defaults; negative initial_per_sec disables.
+[rate_limit]
+initial_per_sec = 50
+burst           = 200
+window          = "5m"
+
+# Per-connection recycle bounds; the server samples a uniform
+# (age, bytes) target inside this rectangle for each connection so
+# observers cannot fingerprint the recycle moment.
+[recycle]
+age_min   = "90m"
+age_max   = "180m"
+bytes_min = 3221225472   # 3 GiB
+bytes_max = 8589934592   # 8 GiB
+
+# Static user table. short_id is 8 bytes (16 hex chars). uid_hex is
+# 1-16 bytes; the value is opaque to mirage and surfaces to the
+# Authorizer as adapter.UserID.
+[[user]]
+short_id = "1111111111111111"
+uid_hex  = "01"
+
+# Static SNI relay pool. Unauthenticated traffic claiming one of
+# these names is forwarded to the matching host:port.
+[[sni_target]]
+name = "www.example.com"
+host = "1.1.1.1"
+port = 443

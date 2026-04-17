@@ -128,6 +128,39 @@ The client MUST:
 Bytes other than `legacy_session_id` MUST round-trip through the
 server to the real CDN unchanged.
 
+### 3.4 Transport parameters
+
+Both peers SHOULD emit QUIC v1 transport parameters whose values match
+the targeted Chrome HTTP/3 release. The reference profile in
+`behavior.Default()` is:
+
+| Parameter                           | Value         |
+| ----------------------------------- | ------------- |
+| `max_idle_timeout`                  | 30 000 ms     |
+| `handshake_idle_timeout` (server)   | 10 000 ms     |
+| `max_udp_payload_size`              | 1452          |
+| `initial_max_data`                  | 15 MiB        |
+| `initial_max_stream_data_bidi_local`  | 6 MiB       |
+| `initial_max_stream_data_bidi_remote` | 6 MiB       |
+| `initial_max_stream_data_uni`       | 6 MiB         |
+| `initial_max_streams_bidi`          | 100           |
+| `initial_max_streams_uni`           | 100           |
+| `ack_delay_exponent`                | 3             |
+| `max_ack_delay`                     | 25 ms         |
+| `active_connection_id_limit`        | 8             |
+| `disable_active_migration`          | absent (false)|
+
+The client populates its parameters via
+`behavior.ApplyToTransportParameters`. The server applies the same
+profile to its `quic-go` `Config` via `behavior.ApplyToQUICConfig`,
+which only fills fields the operator left at zero so explicit
+overrides survive. Additionally the server sets
+`InitialPacketSize = 1252` to match Chrome's initial PMTU.
+
+Connection migration MUST NOT be disabled: real Chrome leaves
+`disable_active_migration` absent, so emitting it would form a
+distinguishable transport-parameter fingerprint.
+
 ## 4. Transparent Forwarding
 
 Packets that fail any check in section 3.2 are forwarded to a real
@@ -200,7 +233,36 @@ fingerprint that has burned previous-generation proxies.
 A reference set of constants per Chrome release lives in package
 `behavior`.
 
-## 7. Connection Recycling
+## 7. Control Stream
+
+The first server-initiated bidirectional stream (QUIC stream id `0x01`)
+is the **control stream**. The server opens it lazily, immediately
+after the handshake completes, and uses it to push protocol-level
+control frames to the client. Application data MUST NOT be carried on
+this stream.
+
+### 7.1 Frame layout
+
+Every control frame is
+
+```
++--------+----------+--------------------+
+| Type 1 | Length 2 | Body (Length bytes)|
++--------+----------+--------------------+
+```
+
+`Type` and `Length` are big-endian. `Length` is bounded by
+`proto.MaxFrameBodyLen` (currently 65 535). Receivers MUST silently
+ignore unknown `Type` values so that minor-version additions do not
+break existing peers.
+
+### 7.2 Defined frame types
+
+| Type | Name                          | Body                          |
+| ---- | ----------------------------- | ----------------------------- |
+| 0x01 | `ConnectionRecycleHint`       | `HandoffWindowMillis` u16 BE  |
+
+## 8. Connection Recycling
 
 At handshake completion the server samples per-connection thresholds:
 
@@ -209,23 +271,82 @@ deadline_age   = uniform(MinAge,   MaxAge)     // default 90..180 min
 deadline_bytes = uniform(MinBytes, MaxBytes)   // default 3..8 GiB
 ```
 
-When either threshold is crossed, AND the BBR controller is in
-ProbeRTT or a low-bandwidth state, the server sends a
-`FrameTypeConnectionRecycleHint` with a suggested handoff window
-(default 30 000 ms).
+When either threshold is crossed the server sends a
+`ConnectionRecycleHint` frame on the control stream (section 7) with a
+suggested handoff window (default 30 000 ms, encoded as the unsigned
+big-endian millisecond value in the body). At most one hint is sent
+per connection.
 
-The client then:
+The client (`client.Pool`) then runs a three-stage handoff:
 
-1. Opens a new mirage connection in parallel, with a fresh SNI.
-2. Routes new application streams to the new connection.
-3. Lets in-flight streams on the old connection drain for up to
-   `HandoffWindowMillis`.
-4. Issues `CONNECTION_CLOSE` on the old connection once drained or
-   the handoff window expires.
+1. **Dial.** Open a fresh mirage connection in parallel, optionally
+   with a different SNI from the configured pool.
+2. **Promote.** Atomically swap the new connection in as "active" so
+   that subsequent `OpenStream` calls land on it. Streams already
+   running on the old connection continue undisturbed.
+3. **Drain & close.** Park the old connection for
+   `min(HandoffWindowMillis, DrainGrace)`. When the grace timer
+   fires, issue `CONNECTION_CLOSE` on the old connection regardless of
+   any remaining in-flight traffic.
 
 Per-user state is keyed by `adapter.UserID`, so it survives rotation.
 
-## 8. Security Considerations
+If the client has not registered an `OnRecycleHint` callback the
+control stream is still accepted but the body is discarded — backwards
+compatibility for clients that do not yet implement pooling.
+
+## 9. Application Framing (Proxy)
+
+The reference TCP proxy in package `proxy` carries a length-prefixed
+request/response on each mirage stream. The format is:
+
+```
+client --> server   ProxyRequest  : Type 1 | Length 2 | Body
+server --> client   ProxyResponse : Status 1 | Length 2 | Body
+```
+
+Body of `ProxyRequest` is `host \0 port_be16` (UTF-8 host, no NUL in
+the host segment). The server returns `Status = 0` on success and
+streams the upstream TCP data after the response header. Non-zero
+status values are reserved.
+
+### 9.1 Stream error codes
+
+Both peers MAY terminate a stream half via `STOP_SENDING` (frame type
+`0x05`) and `RESET_STREAM` (frame type `0x04`). The application error
+code carried in those frames is a `uint64`. The proxy uses the
+following codes:
+
+| Code  | Meaning                                              |
+| ----- | ---------------------------------------------------- |
+| 0x10  | `ProxyErrIdleTimeout` — server-side idle watchdog    |
+
+Other codes are reserved. Receivers MUST treat unknown codes as
+opaque and surface them through `client.StreamError`.
+
+## 10. Master Key Rotation
+
+The server holds a **master key set** consisting of one *primary* key
+plus zero or more *additional* keys. Window-key derivation
+(section 2) is performed independently for every key in the set, and
+short-id verification (section 5.2) accepts a packet if any of the
+derived AEAD instances authenticates it.
+
+Operators rotate keys with a make-before-break sequence:
+
+1. **Stage.** Distribute a new key out of band; deploy it as an
+   *additional* key while the existing primary remains active.
+2. **Promote.** Call `Server.RotateMasterKeys(new, old)`, swapping the
+   roles atomically. Old sessions continue to verify under `old`;
+   newly handshaking clients use `new`.
+3. **Retire.** After the longest configured `MaxAge` plus the recycle
+   handoff window has elapsed, call
+   `Server.RotateMasterKeys(new)` to drop the old key entirely.
+
+`RotateMasterKeys` is safe to call at any time and never tears down an
+established QUIC connection: it only swaps the dispatcher's verifier.
+
+## 11. Security Considerations
 
 In scope:
 
@@ -255,7 +376,7 @@ Notes:
 - Replay: L1 rejects stale-window packets at near-zero cost; L2 rejects
   precise replays inside the current window.
 
-## 9. Versioning
+## 12. Versioning
 
 - `proto.ProtocolVersion` is `mirage/0.1`. It is mixed into HKDF
   context but never sent on the wire.
@@ -263,7 +384,7 @@ Notes:
 - New control-stream frame types may be added within a minor version;
   receivers MUST silently ignore unknown types.
 
-## 10. Open Questions
+## 13. Open Questions
 
 1. Exact location of the `Counter` field used by L2.
 2. How the client signals which `behavior` profile it targets.
