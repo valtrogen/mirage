@@ -21,6 +21,14 @@ type streamMap struct {
 	pending   []*Stream
 	pendingCh chan struct{}
 	closed    bool
+
+	// controlSink, when non-nil, captures the first server-initiated
+	// bidirectional stream the dispatcher observes (the mirage
+	// control stream) instead of placing it on the AcceptStream
+	// queue. The integrator typically wires this in
+	// configureControlStream when Config.OnRecycleHint is set.
+	controlSink     chan<- *Stream
+	controlConsumed bool
 }
 
 func newStreamMap(c *Conn) *streamMap {
@@ -33,12 +41,28 @@ func newStreamMap(c *Conn) *streamMap {
 }
 
 // openLocal allocates the next client-initiated bidi stream ID and
-// registers it in the map.
+// registers it in the map. The new stream's send-side flow control
+// limit is seeded from the peer's initial_max_stream_data_bidi_remote
+// (RFC 9000 §18.2): the server tells us, for streams we open against
+// it, how many bytes it is initially willing to receive.
+// defaultSendBufCap is the maximum bytes buffered in Stream.sendBuf
+// before Write blocks. This provides backpressure to fast producers
+// so we don't exhaust memory when the network is slower than the app.
+const defaultSendBufCap = 256 * 1024 // 256 KiB
+
 func (m *streamMap) openLocal() *Stream {
 	m.mu.Lock()
 	id := m.nextLocal
 	m.nextLocal += 4
 	s := newStream(m.conn, id)
+	if tp := m.conn.serverTP; tp != nil {
+		s.sendMaxData = tp.InitialMaxStreamDataBidiRemote
+	}
+	// Initialize receive-side flow control from our advertised limits.
+	// For client-initiated streams, we use InitialMaxStreamDataBidiLocal.
+	s.recvWindow = m.conn.localInitialMaxStreamData(id)
+	s.recvMaxDataAdvertised = s.recvWindow
+	s.sendBufCap = defaultSendBufCap
 	m.streams[id] = s
 	m.mu.Unlock()
 	return s
@@ -54,12 +78,39 @@ func (m *streamMap) lookupOrCreate(id uint64) *Stream {
 		return s
 	}
 	s := newStream(m.conn, id)
+	if tp := m.conn.serverTP; tp != nil {
+		// For peer-initiated streams the server has authorised our
+		// send side via initial_max_stream_data_bidi_local (it owns
+		// the local-vs-remote naming from its perspective: we write
+		// to a stream the peer initiated against us, so this is the
+		// "local" direction on the peer).
+		if isServerInitiated(id) {
+			s.sendMaxData = tp.InitialMaxStreamDataBidiLocal
+		} else {
+			s.sendMaxData = tp.InitialMaxStreamDataBidiRemote
+		}
+	}
+	// Initialize receive-side flow control from our advertised limits.
+	s.recvWindow = m.conn.localInitialMaxStreamData(id)
+	s.recvMaxDataAdvertised = s.recvWindow
+	s.sendBufCap = defaultSendBufCap
 	m.streams[id] = s
 	if isServerInitiated(id) {
-		m.pending = append(m.pending, s)
-		select {
-		case m.pendingCh <- struct{}{}:
-		default:
+		// Steer the very first server-initiated bidi stream into
+		// the control sink when one is registered; everything else
+		// surfaces via AcceptStream as before.
+		if m.controlSink != nil && !m.controlConsumed {
+			m.controlConsumed = true
+			select {
+			case m.controlSink <- s:
+			default:
+			}
+		} else {
+			m.pending = append(m.pending, s)
+			select {
+			case m.pendingCh <- struct{}{}:
+			default:
+			}
 		}
 	}
 	return s

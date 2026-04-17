@@ -12,8 +12,13 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"github.com/valtrogen/mirage/behavior"
+	"github.com/valtrogen/mirage/congestion"
+	"github.com/valtrogen/mirage/congestion/bbr2"
 	"github.com/valtrogen/mirage/handshake"
+	"github.com/valtrogen/mirage/padder"
 	"github.com/valtrogen/mirage/proto"
+	"github.com/valtrogen/mirage/recycle"
 	"github.com/valtrogen/mirage/replay"
 	"github.com/valtrogen/mirage/transport"
 )
@@ -53,6 +58,15 @@ type Conn struct {
 	dcid []byte
 	scid []byte
 
+	// cids tracks every destination connection ID the peer has
+	// authorised the client to send with, plus the sequence number
+	// of the one currently in use. The handshake bootstraps it from
+	// the server's adopted SCID; subsequent NEW_CONNECTION_ID frames
+	// feed it so the senderLoop can rotate DCIDs on a Chrome-like
+	// cadence (see Behavior.CIDRotateInterval).
+	cids          *cidPool
+	lastCIDRotate time.Time
+
 	utlsConn *utls.UQUICConn
 
 	mu                sync.Mutex
@@ -63,28 +77,99 @@ type Conn struct {
 	cryptoSent        [4]uint64
 	cryptoRecvd       [4]uint64
 	cryptoRecvBuf     [4]map[uint64][]byte
-	largestRecvPN     [4]int64
 	ackPending        [4]bool
-	recvPNs           [4]map[uint64]struct{}
+	recvWindow        [4]*replay.SlidingWindow
 	serverDCIDAdopted bool
+	// 1-RTT key-update state (RFC 9001 §6). Mirage tracks the
+	// current and next-phase AEAD keys for both directions so it
+	// can transparently follow a peer-initiated rotation. The
+	// header protection key never changes across updates, so
+	// nextRead/nextWrite share the headerMask of the current key.
+	appReadSecret  []byte
+	appWriteSecret []byte
+	appNextRead    *transport.PacketProtection
+	appNextWrite   *transport.PacketProtection
+	recvKeyPhase   bool
+	sendKeyPhase   bool
 
 	streams *streamMap
 
-	sentMu  sync.Mutex
-	sent    map[uint64]*sentPacket
-	rttSRTT time.Duration
+	sentMu        sync.Mutex
+	sent          map[uint64]*sentPacket
+	bytesInFlight congestion.ByteCount
+	// pmtuProbes records the size of PMTU probe packets so we can
+	// call pmtuSearch.Confirmed when they are acknowledged.
+	pmtuProbes map[uint64]uint16
+	// sentTimes records the wall-clock send time of every 1-RTT
+	// packet — both retransmittable ones (also held in c.sent) and
+	// ACK-only ones — so processAppAck can compute an RFC 9002
+	// §5.1 RTT sample for whichever packet number ends up being
+	// the largest acknowledged. Entries are dropped on ack or loss.
+	sentTimes map[uint64]time.Time
+	// lostQueue holds packets the receiver loop has declared lost via
+	// RFC 9002 §6.1 detection. The sender loop drains this queue on
+	// every iteration of retransmitApp and immediately resends the
+	// stream payload at a fresh packet number.
+	lostQueue []*sentPacket
+	// largestAckedPN is the highest 1-RTT packet number we have
+	// observed in any incoming ACK. Loss detection compares against
+	// this rather than the per-ack largest so out-of-order ACK frames
+	// cannot regress the loss horizon.
+	largestAckedPN     uint64
+	largestAckedSentAt time.Time
+	hasLargestAcked    bool
+
+	rtt *congestion.RTTStats
+	// cc is the congestion controller. Implementations are
+	// responsible for their own internal locking; mirage drives
+	// callbacks from both the sender and receiver goroutines.
+	cc congestion.Controller
+
+	// flowMu guards the connection-level flow control counters.
+	// It is its own mutex (not c.mu) because the sender holds it
+	// across nextSendChunk calls and we want to keep header / key
+	// state on c.mu independent of the stream-data accounting.
+	flowMu sync.Mutex
+	// flowConnMaxData is the absolute byte offset across all
+	// streams the peer has authorised us to send (RFC 9000 §19.9).
+	// Initialised from the server's initial_max_data and ratcheted
+	// upwards by MAX_DATA frames.
+	flowConnMaxData uint64
+	// flowConnSent is the running total of payload bytes we have
+	// emitted across all streams. New chunks may only be sent when
+	// flowConnSent + chunk <= flowConnMaxData.
+	flowConnSent uint64
+	// pendingMaxStreamData holds per-stream MAX_STREAM_DATA updates
+	// that Stream.Read has queued. The senderLoop drains this map
+	// and emits the corresponding frames.
+	pendingMaxStreamData map[uint64]uint64
+	// pendingResetStream and pendingStopSending hold abrupt
+	// stream-termination frames Stream.Reset and Stream.CancelRead
+	// have queued. Each map is keyed by stream ID.
+	pendingResetStream map[uint64]pendingResetStream
+	pendingStopSending map[uint64]uint64
 
 	wakeCh chan struct{}
+
+	pingClock  *behavior.PingClock
+	padder     *padder.Padder
+	pmtuSearch *behavior.PMTUSearch
 
 	handshakeDone atomic.Bool
 	closed        atomic.Bool
 	readErr       atomic.Pointer[errBox]
+	aeadDrops     atomic.Uint64
 
 	serverTPRaw []byte
 	serverTP    *transport.TransportParameters
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
+
+	// controlStreamCh receives the first server-initiated bidi
+	// stream when Config.OnRecycleHint is set. The control reader
+	// goroutine drains it once and then loops on ReadControlFrame.
+	controlStreamCh chan *Stream
 }
 
 // errBox wraps an error so atomic.Pointer[errBox] can hold any
@@ -113,6 +198,7 @@ func (c *Conn) loadReadErr() error {
 type sentPacket struct {
 	pn      uint64
 	sentAt  time.Time
+	size    congestion.ByteCount
 	streams []sentStreamFrame
 	retries int
 }
@@ -138,16 +224,30 @@ func Dial(ctx context.Context, addr string, cfg *Config) (*Conn, error) {
 		return nil, fmt.Errorf("mirage/client: listen: %w", err)
 	}
 
+	bh := cfg.effectiveBehavior()
+	rtt := congestion.NewRTTStats()
+	rtt.SetMaxAckDelay(bh.MaxAckDelay)
+	cc := bbr2.New(congestion.ByteCount(bh.MaxUDPPayloadSize), 0)
 	c := &Conn{
-		cfg:     cfg,
-		pconn:   pconn,
-		remote:  udpAddr,
-		stopCh:  make(chan struct{}),
-		wakeCh:  make(chan struct{}, 1),
-		sent:    make(map[uint64]*sentPacket),
-		rttSRTT: 100 * time.Millisecond,
+		cfg:        cfg,
+		pconn:      pconn,
+		remote:     udpAddr,
+		stopCh:     make(chan struct{}),
+		wakeCh:     make(chan struct{}, 1),
+		sent:       make(map[uint64]*sentPacket),
+		sentTimes:  make(map[uint64]time.Time),
+		pmtuProbes: make(map[uint64]uint16),
+		rtt:        rtt,
+		cc:         cc,
+		pingClock:  behavior.NewPingClock(bh.PingInterval),
+		padder:     padder.New(cfg.effectivePadderPolicy()),
+		pmtuSearch: behavior.NewPMTUSearch(bh),
 	}
 	c.streams = newStreamMap(c)
+	if cfg.OnRecycleHint != nil {
+		c.controlStreamCh = make(chan *Stream, 1)
+		c.streams.controlSink = c.controlStreamCh
+	}
 	if err := c.init(ctx); err != nil {
 		_ = pconn.Close()
 		return nil, err
@@ -164,6 +264,17 @@ func (c *Conn) init(ctx context.Context) error {
 	if _, err := rand.Read(c.scid); err != nil {
 		return err
 	}
+	// Pre-allocate the CID pool; it is populated for real once the
+	// server's SCID is adopted. The retention limit mirrors the
+	// active_connection_id_limit we advertise in transport
+	// parameters so we never accept more than the peer is willing
+	// to issue.
+	cidLimit := behavior.Default().ActiveConnectionIDLimit
+	if c.cfg != nil {
+		cidLimit = c.cfg.effectiveBehavior().ActiveConnectionIDLimit
+	}
+	c.cids = newCIDPool(int(cidLimit))
+	c.lastCIDRotate = time.Now()
 	icp, err := transport.DeriveClientInitialProtection(c.dcid)
 	if err != nil {
 		return err
@@ -207,20 +318,13 @@ func (c *Conn) init(ctx context.Context) error {
 	overrideALPN(&spec, c.cfg.effectiveALPN())
 	restrictToTLS13(&spec)
 
+	bh := c.cfg.effectiveBehavior()
 	tp := &transport.TransportParameters{
-		MaxIdleTimeoutMillis:           uint64(c.cfg.effectiveIdleTimeout() / time.Millisecond),
-		MaxUDPPayloadSize:              1452,
-		InitialMaxData:                 1 << 22,
-		InitialMaxStreamDataBidiLocal:  1 << 20,
-		InitialMaxStreamDataBidiRemote: 1 << 20,
-		InitialMaxStreamDataUni:        1 << 20,
-		InitialMaxStreamsBidi:          0,
-		InitialMaxStreamsUni:           3,
-		AckDelayExponent:               3,
-		MaxAckDelayMillis:              25,
-		ActiveConnectionIDLimit:        4,
-		DisableActiveMigration:         true,
-		InitialSourceConnectionID:      append([]byte(nil), c.scid...),
+		InitialSourceConnectionID: append([]byte(nil), c.scid...),
+	}
+	behavior.ApplyToTransportParameters(tp, bh)
+	if to := c.cfg.effectiveIdleTimeout(); to > 0 {
+		tp.MaxIdleTimeoutMillis = uint64(to / time.Millisecond)
 	}
 	tpBytes := tp.Marshal()
 	addQUICTransportParameters(&spec, tpBytes)
@@ -244,8 +348,8 @@ func (c *Conn) init(ctx context.Context) error {
 		return fmt.Errorf("mirage/client: tls Start: %w", err)
 	}
 
-	for i := range c.largestRecvPN {
-		c.largestRecvPN[i] = -1
+	for i := range c.recvWindow {
+		c.recvWindow[i] = replay.NewSlidingWindow(64)
 	}
 
 	c.wg.Add(1)
@@ -262,6 +366,11 @@ func (c *Conn) init(ctx context.Context) error {
 
 	c.wg.Add(1)
 	go c.senderLoop()
+
+	if c.controlStreamCh != nil {
+		c.wg.Add(1)
+		go c.controlStreamReader()
+	}
 	return nil
 }
 
@@ -294,6 +403,11 @@ func (c *Conn) pumpEvents() error {
 				return fmt.Errorf("mirage/client: parse server transport params: %w", err)
 			}
 			c.serverTP = tp
+			c.flowMu.Lock()
+			if tp.InitialMaxData > c.flowConnMaxData {
+				c.flowConnMaxData = tp.InitialMaxData
+			}
+			c.flowMu.Unlock()
 		case utls.QUICHandshakeDone:
 			dbg("uTLS event: HandshakeDone")
 			c.handshakeDone.Store(true)
@@ -317,6 +431,24 @@ func (c *Conn) installSecret(lvl encryptionLevel, suite uint16, secret []byte, i
 		c.pp[lvl].read = pp
 	} else {
 		c.pp[lvl].write = pp
+	}
+	if lvl == levelApp {
+		secretCopy := append([]byte(nil), secret...)
+		nextSecret, err := transport.NextAppSecret(suite, secretCopy)
+		if err != nil {
+			return err
+		}
+		nextPP, err := transport.RekeyForUpdate(suite, pp, nextSecret)
+		if err != nil {
+			return err
+		}
+		if isRead {
+			c.appReadSecret = secretCopy
+			c.appNextRead = nextPP
+		} else {
+			c.appWriteSecret = secretCopy
+			c.appNextWrite = nextPP
+		}
 	}
 	return nil
 }
@@ -357,12 +489,13 @@ func (c *Conn) sendConnectionClose(code uint64, reason string) {
 	pp := c.pp[levelApp].write
 	pn := c.pn[levelApp]
 	c.pn[levelApp] = pn + 1
+	phase := c.sendKeyPhase
 	c.mu.Unlock()
 	if pp == nil {
 		return
 	}
 	payload := transport.AppendConnectionCloseFrame(nil, code, 0, reason)
-	pkt, err := transport.BuildShortHeader(c.dcid, uint32(pn), payload, false, pp)
+	pkt, err := transport.BuildShortHeader(c.sendDCID(), uint32(pn), payload, phase, pp)
 	if err != nil {
 		return
 	}
@@ -418,6 +551,30 @@ func (c *Conn) RemoteAddr() net.Addr { return c.remote }
 // HandshakeComplete reports whether the TLS handshake has finished.
 func (c *Conn) HandshakeComplete() bool { return c.handshakeDone.Load() }
 
+// AEADDrops returns the number of 1-RTT datagrams the connection
+// silently discarded after an AEAD or short-header parse failure.
+// Counter only — observed values are useful for spotting key
+// confusion, peer bugs, or path corruption without making the
+// connection itself fail.
+func (c *Conn) AEADDrops() uint64 { return c.aeadDrops.Load() }
+
+// RTT returns the connection's RTT estimator. Callers may read its
+// fields concurrently with the data plane; the returned pointer is
+// stable for the lifetime of the connection.
+func (c *Conn) RTT() *congestion.RTTStats { return c.rtt }
+
+// BytesInFlight returns the number of payload bytes whose carrying
+// 1-RTT packets have been written to the wire but not yet
+// acknowledged or declared lost. Useful for tests and metrics.
+func (c *Conn) BytesInFlight() uint64 {
+	return uint64(c.snapshotBytesInFlight())
+}
+
+// CongestionController returns the controller installed on this
+// connection. The returned value is stable for the connection's
+// lifetime; callers may read controller state but must not swap it.
+func (c *Conn) CongestionController() congestion.Controller { return c.cc }
+
 // OpenStream allocates a new client-initiated bidirectional stream. It
 // does not block on the network; failures surface from Read/Write.
 func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
@@ -451,6 +608,114 @@ func (c *Conn) AcceptStream(ctx context.Context) (*Stream, error) {
 	case r := <-resCh:
 		return r.s, r.err
 	}
+}
+
+// localInitialMaxStreamData returns the initial receive window we
+// advertised for a stream with the given ID. This is the limit we
+// told the peer in our transport parameters (RFC 9000 §18.2). It must
+// stay in lock-step with behavior.ApplyToTransportParameters; the two
+// read from the same Behavior config so they cannot drift.
+func (c *Conn) localInitialMaxStreamData(streamID uint64) uint64 {
+	cfg := c.cfg
+	if cfg == nil {
+		// Tests sometimes wire a Conn directly without a Config; fall
+		// back to the canonical Chrome H3 profile so the initial
+		// windows still match what we would advertise on the wire.
+		def := behavior.Default()
+		if streamID&0x01 != 0 {
+			return def.InitialMaxStreamDataBidiRemote
+		}
+		return def.InitialMaxStreamDataBidiLocal
+	}
+	bh := cfg.effectiveBehavior()
+	if streamID&0x01 != 0 {
+		return bh.InitialMaxStreamDataBidiRemote
+	}
+	return bh.InitialMaxStreamDataBidiLocal
+}
+
+// controlStreamReader is the goroutine spawned when Config.OnRecycleHint
+// is set. It waits for the dispatcher to surface the first
+// server-initiated bidi stream, then loops reading control frames and
+// fans them out to the registered callback.
+//
+// The reader exits when the stream returns an error (EOF, connection
+// close) or when the connection is shutting down. Errors are logged
+// via the connection's stored read-error so the operator can see them
+// surface from later Read/Write calls.
+func (c *Conn) controlStreamReader() {
+	defer c.wg.Done()
+	var cs *Stream
+	select {
+	case cs = <-c.controlStreamCh:
+	case <-c.stopCh:
+		return
+	}
+	for {
+		t, body, err := ReadControlFrame(cs)
+		if err != nil {
+			return
+		}
+		if t == proto.FrameTypeConnectionRecycleHint {
+			hint, err := recycle.DecodeHint(body)
+			if err != nil {
+				continue
+			}
+			if cb := c.cfg.OnRecycleHint; cb != nil {
+				go cb(hint)
+			}
+		}
+		// Unknown frame types are silently ignored, matching the
+		// receiver-discipline rule documented in proto/frames.go.
+	}
+}
+
+// queueMaxStreamData records that we need to send a MAX_STREAM_DATA
+// frame for the given stream. The senderLoop picks these up and emits
+// them on the next iteration.
+func (c *Conn) queueMaxStreamData(streamID, maxData uint64) {
+	c.flowMu.Lock()
+	if c.pendingMaxStreamData == nil {
+		c.pendingMaxStreamData = make(map[uint64]uint64)
+	}
+	c.pendingMaxStreamData[streamID] = maxData
+	c.flowMu.Unlock()
+	c.wakeSender()
+}
+
+// pendingResetStream is the per-stream record queued by
+// Stream.Reset, awaiting emission by the sender loop.
+type pendingResetStream struct {
+	ErrorCode uint64
+	FinalSize uint64
+}
+
+// queueResetStream records that we need to send a RESET_STREAM frame
+// for streamID (RFC 9000 §19.4). The senderLoop drains the queue.
+// Repeated calls overwrite; a stream is reset at most once.
+func (c *Conn) queueResetStream(streamID, errorCode, finalSize uint64) {
+	c.flowMu.Lock()
+	if c.pendingResetStream == nil {
+		c.pendingResetStream = make(map[uint64]pendingResetStream)
+	}
+	c.pendingResetStream[streamID] = pendingResetStream{
+		ErrorCode: errorCode,
+		FinalSize: finalSize,
+	}
+	c.flowMu.Unlock()
+	c.wakeSender()
+}
+
+// queueStopSending records that we need to send a STOP_SENDING frame
+// for streamID (RFC 9000 §19.5).
+func (c *Conn) queueStopSending(streamID, errorCode uint64) {
+	c.flowMu.Lock()
+	if c.pendingStopSending == nil {
+		c.pendingStopSending = make(map[uint64]uint64)
+	}
+	c.pendingStopSending[streamID] = errorCode
+	c.flowMu.Unlock()
+	c.wakeSender()
 }
 
 // wakeSender nudges the sender goroutine. Safe to call from any
