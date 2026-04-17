@@ -1,0 +1,17 @@
+# build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# local working notes
+/docs/todo.md
