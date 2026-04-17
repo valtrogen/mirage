@@ -2,14 +2,15 @@ package behavior
 
 import "time"
 
-// ChromeH3 is the set of timing and sizing constants we line up with so
-// that a mirage QUIC connection looks, on the wire, like a Chrome
-// HTTP/3 connection.
+// ChromeH3 is the set of timing, sizing, and flow-control constants we
+// align with so that a mirage QUIC connection looks, on the wire, like a
+// Chrome HTTP/3 connection.
 //
-// Values are taken from Chromium's net/quic defaults as of the 12x
-// releases. They are deliberately read-only: changing one of these in
-// production drifts the fingerprint and is the kind of mistake that
-// gets a protocol classified.
+// Values are taken from Chromium's net/quic defaults as of the 13x
+// release stream and from packet captures of real Chrome HTTP/3 traffic.
+// They are deliberately read-only: changing one of these in production
+// drifts the fingerprint and is the kind of mistake that gets a protocol
+// classified.
 type ChromeH3 struct {
 	// PingInterval is the period between client-issued PING frames on
 	// an otherwise-idle connection. Chrome uses ~30s.
@@ -27,11 +28,16 @@ type ChromeH3 struct {
 	// Chrome uses 30s.
 	MaxIdleTimeout time.Duration
 
+	// HandshakeIdleTimeout caps the time a half-open handshake survives
+	// without progress. Chrome's effective value is ~10s.
+	HandshakeIdleTimeout time.Duration
+
 	// MaxUDPPayloadSize is the largest UDP payload we advertise. Chrome
 	// uses 1452 (a typical IPv4 path MTU minus QUIC headers).
 	MaxUDPPayloadSize uint64
 
-	// PMTUInitial is the conservative initial probe size.
+	// PMTUInitial is the conservative initial probe size. Doubles as
+	// quic.Config.InitialPacketSize on the server.
 	PMTUInitial uint16
 
 	// PMTUSearchStep is the increment used by Chrome's DPLPMTUD search.
@@ -46,22 +52,80 @@ type ChromeH3 struct {
 	PMTUMaxProbes int
 
 	// ActiveConnectionIDLimit is the value advertised in transport
-	// parameters. Chrome uses 4.
+	// parameters. Real Chrome H3 advertises 8.
 	ActiveConnectionIDLimit uint64
+
+	// InitialMaxData is the initial connection-level receive credit
+	// advertised to the peer (RFC 9000 §4.1). Chrome uses 15 MiB.
+	InitialMaxData uint64
+
+	// InitialMaxStreamDataBidiLocal is the initial per-stream receive
+	// credit for streams the local peer initiates. Chrome uses 6 MiB.
+	InitialMaxStreamDataBidiLocal uint64
+
+	// InitialMaxStreamDataBidiRemote is the same for peer-initiated
+	// streams. Chrome uses 6 MiB.
+	InitialMaxStreamDataBidiRemote uint64
+
+	// InitialMaxStreamDataUni is the initial credit for unidirectional
+	// streams. Chrome uses 6 MiB.
+	InitialMaxStreamDataUni uint64
+
+	// InitialMaxStreamsBidi is the maximum number of concurrent
+	// bidirectional streams the peer may open. Chrome uses 100.
+	InitialMaxStreamsBidi uint64
+
+	// InitialMaxStreamsUni is the maximum number of concurrent
+	// unidirectional streams the peer may open. Chrome uses 100.
+	InitialMaxStreamsUni uint64
+
+	// MaxStreamReceiveWindow is the auto-tune ceiling for per-stream
+	// receive windows. quic-go uses this on the server.
+	MaxStreamReceiveWindow uint64
+
+	// MaxConnectionReceiveWindow is the auto-tune ceiling for the
+	// connection-level receive window.
+	MaxConnectionReceiveWindow uint64
+
+	// CIDRotateInterval is the period between voluntary destination
+	// connection ID rotations performed by the client. A long-lived
+	// connection that keeps the same DCID exposes a packet-capture
+	// fingerprint distinguishable from real Chrome, which rotates
+	// CIDs on a similar cadence to its NEW_CONNECTION_ID issuance.
+	// Zero disables voluntary rotation; the client still honours
+	// peer-issued retire_prior_to in NEW_CONNECTION_ID frames.
+	CIDRotateInterval time.Duration
 }
 
 // Default returns the canonical Chrome HTTP/3 profile mirage targets.
 func Default() ChromeH3 {
 	return ChromeH3{
-		PingInterval:            30 * time.Second,
-		MaxAckDelay:             25 * time.Millisecond,
-		AckDelayExponent:        3,
-		MaxIdleTimeout:          30 * time.Second,
-		MaxUDPPayloadSize:       1452,
-		PMTUInitial:             1252,
-		PMTUSearchStep:          24,
-		PMTUSearchInterval:      30 * time.Second,
-		PMTUMaxProbes:           5,
-		ActiveConnectionIDLimit: 4,
+		PingInterval:                   30 * time.Second,
+		MaxAckDelay:                    25 * time.Millisecond,
+		AckDelayExponent:               3,
+		MaxIdleTimeout:                 30 * time.Second,
+		HandshakeIdleTimeout:           10 * time.Second,
+		MaxUDPPayloadSize:              1452,
+		PMTUInitial:                    1252,
+		PMTUSearchStep:                 24,
+		PMTUSearchInterval:             30 * time.Second,
+		PMTUMaxProbes:                  5,
+		ActiveConnectionIDLimit:        8,
+		InitialMaxData:                 15 << 20,
+		InitialMaxStreamDataBidiLocal:  6 << 20,
+		InitialMaxStreamDataBidiRemote: 6 << 20,
+		InitialMaxStreamDataUni:        6 << 20,
+		InitialMaxStreamsBidi:          100,
+		InitialMaxStreamsUni:           100,
+		MaxStreamReceiveWindow:         16 << 20,
+		MaxConnectionReceiveWindow:     24 << 20,
+		CIDRotateInterval:              5 * time.Minute,
 	}
+}
+
+// IsZero reports whether c is the zero value (no fields set). Used by
+// callers that want to substitute Default() for an unconfigured
+// ChromeH3.
+func (c ChromeH3) IsZero() bool {
+	return c == ChromeH3{}
 }

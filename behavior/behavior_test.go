@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
 	"github.com/valtrogen/mirage/transport"
 )
 
@@ -21,11 +23,26 @@ func TestDefaultMatchesChromeH3(t *testing.T) {
 	if d.MaxIdleTimeout != 30*time.Second {
 		t.Fatalf("MaxIdleTimeout %v", d.MaxIdleTimeout)
 	}
+	if d.HandshakeIdleTimeout != 10*time.Second {
+		t.Fatalf("HandshakeIdleTimeout %v", d.HandshakeIdleTimeout)
+	}
 	if d.MaxUDPPayloadSize != 1452 {
 		t.Fatalf("MaxUDPPayloadSize %d", d.MaxUDPPayloadSize)
 	}
-	if d.ActiveConnectionIDLimit != 4 {
+	if d.ActiveConnectionIDLimit != 8 {
 		t.Fatalf("ActiveConnectionIDLimit %d", d.ActiveConnectionIDLimit)
+	}
+	if d.InitialMaxData != 15<<20 {
+		t.Fatalf("InitialMaxData %d", d.InitialMaxData)
+	}
+	if d.InitialMaxStreamDataBidiLocal != 6<<20 {
+		t.Fatalf("InitialMaxStreamDataBidiLocal %d", d.InitialMaxStreamDataBidiLocal)
+	}
+	if d.InitialMaxStreamsBidi != 100 {
+		t.Fatalf("InitialMaxStreamsBidi %d", d.InitialMaxStreamsBidi)
+	}
+	if d.CIDRotateInterval != 5*time.Minute {
+		t.Fatalf("CIDRotateInterval %v", d.CIDRotateInterval)
 	}
 }
 
@@ -81,7 +98,9 @@ func TestPMTUSearchStopsAtMaxProbes(t *testing.T) {
 
 func TestApplyToTransportParameters(t *testing.T) {
 	cfg := Default()
-	tp := &transport.TransportParameters{}
+	tp := &transport.TransportParameters{
+		DisableActiveMigration: true, // verify ApplyTo clears this
+	}
 	ApplyToTransportParameters(tp, cfg)
 	if tp.MaxIdleTimeoutMillis != 30000 {
 		t.Fatalf("idle %d", tp.MaxIdleTimeoutMillis)
@@ -95,7 +114,82 @@ func TestApplyToTransportParameters(t *testing.T) {
 	if tp.MaxUDPPayloadSize != 1452 {
 		t.Fatalf("udp %d", tp.MaxUDPPayloadSize)
 	}
-	if tp.ActiveConnectionIDLimit != 4 {
+	if tp.ActiveConnectionIDLimit != 8 {
 		t.Fatalf("acid %d", tp.ActiveConnectionIDLimit)
+	}
+	if tp.InitialMaxData != 15<<20 {
+		t.Fatalf("initial_max_data %d", tp.InitialMaxData)
+	}
+	if tp.InitialMaxStreamDataBidiLocal != 6<<20 {
+		t.Fatalf("imsd_local %d", tp.InitialMaxStreamDataBidiLocal)
+	}
+	if tp.InitialMaxStreamDataBidiRemote != 6<<20 {
+		t.Fatalf("imsd_remote %d", tp.InitialMaxStreamDataBidiRemote)
+	}
+	if tp.InitialMaxStreamDataUni != 6<<20 {
+		t.Fatalf("imsd_uni %d", tp.InitialMaxStreamDataUni)
+	}
+	if tp.InitialMaxStreamsBidi != 100 {
+		t.Fatalf("ims_bidi %d", tp.InitialMaxStreamsBidi)
+	}
+	if tp.InitialMaxStreamsUni != 100 {
+		t.Fatalf("ims_uni %d", tp.InitialMaxStreamsUni)
+	}
+	if tp.DisableActiveMigration {
+		t.Fatal("Chrome H3 must not advertise disable_active_migration")
+	}
+}
+
+func TestApplyToQUICConfigFillsDefaults(t *testing.T) {
+	cfg := Default()
+	qc := &quic.Config{}
+	ApplyToQUICConfig(qc, cfg)
+	if qc.HandshakeIdleTimeout != 10*time.Second {
+		t.Fatalf("handshake idle %v", qc.HandshakeIdleTimeout)
+	}
+	if qc.MaxIdleTimeout != 30*time.Second {
+		t.Fatalf("idle %v", qc.MaxIdleTimeout)
+	}
+	if qc.InitialStreamReceiveWindow != 6<<20 {
+		t.Fatalf("initial stream rwnd %d", qc.InitialStreamReceiveWindow)
+	}
+	if qc.MaxStreamReceiveWindow != 16<<20 {
+		t.Fatalf("max stream rwnd %d", qc.MaxStreamReceiveWindow)
+	}
+	if qc.InitialConnectionReceiveWindow != 15<<20 {
+		t.Fatalf("initial conn rwnd %d", qc.InitialConnectionReceiveWindow)
+	}
+	if qc.MaxConnectionReceiveWindow != 24<<20 {
+		t.Fatalf("max conn rwnd %d", qc.MaxConnectionReceiveWindow)
+	}
+	if qc.MaxIncomingStreams != 100 {
+		t.Fatalf("max bidi %d", qc.MaxIncomingStreams)
+	}
+	if qc.MaxIncomingUniStreams != 100 {
+		t.Fatalf("max uni %d", qc.MaxIncomingUniStreams)
+	}
+	if qc.InitialPacketSize != 1252 {
+		t.Fatalf("initial pkt size %d", qc.InitialPacketSize)
+	}
+	if qc.KeepAlivePeriod != 0 {
+		t.Fatalf("KeepAlivePeriod must stay 0 for Chrome alignment, got %v", qc.KeepAlivePeriod)
+	}
+}
+
+func TestApplyToQUICConfigPreservesOverrides(t *testing.T) {
+	cfg := Default()
+	qc := &quic.Config{
+		HandshakeIdleTimeout: 7 * time.Second,
+		MaxIncomingStreams:   42,
+	}
+	ApplyToQUICConfig(qc, cfg)
+	if qc.HandshakeIdleTimeout != 7*time.Second {
+		t.Fatalf("override clobbered: %v", qc.HandshakeIdleTimeout)
+	}
+	if qc.MaxIncomingStreams != 42 {
+		t.Fatalf("override clobbered: %d", qc.MaxIncomingStreams)
+	}
+	if qc.MaxIdleTimeout != 30*time.Second {
+		t.Fatalf("default not filled when caller left zero: %v", qc.MaxIdleTimeout)
 	}
 }
