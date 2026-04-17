@@ -134,6 +134,88 @@ func derivePPChaChaPoly(secret []byte) (*PacketProtection, error) {
 	}, nil
 }
 
+// NextAppSecret derives the application-level traffic secret for the
+// next key phase (RFC 9001 §6.1):
+//
+//	next_secret = HKDF-Expand-Label(secret, "quic ku", "", Hash.length)
+//
+// cipherSuiteID picks the hash and output length: SHA-256 (32) for
+// AES-128-GCM and ChaCha20-Poly1305, SHA-384 (48) for AES-256-GCM.
+func NextAppSecret(cipherSuiteID uint16, secret []byte) ([]byte, error) {
+	switch cipherSuiteID {
+	case CipherSuiteAES128GCMSHA256, CipherSuiteChaCha20Poly1305SHA256:
+		return hkdfExpandLabelHash(sha256.New, secret, "quic ku", 32)
+	case CipherSuiteAES256GCMSHA384:
+		return hkdfExpandLabelHash(sha512.New384, secret, "quic ku", 48)
+	default:
+		return nil, ErrUnsupportedCipherSuite
+	}
+}
+
+// RekeyForUpdate derives a new PacketProtection for the next key
+// phase. The AEAD key and IV are recomputed from nextSecret; the
+// header protection function is shared with base because RFC 9001 §6
+// keeps the header protection key constant across key updates.
+func RekeyForUpdate(cipherSuiteID uint16, base *PacketProtection, nextSecret []byte) (*PacketProtection, error) {
+	if base == nil {
+		return nil, errors.New("mirage: nil base protection")
+	}
+	switch cipherSuiteID {
+	case CipherSuiteAES128GCMSHA256:
+		return rekeyAESGCM(sha256.New, 16, base, nextSecret)
+	case CipherSuiteAES256GCMSHA384:
+		return rekeyAESGCM(sha512.New384, 32, base, nextSecret)
+	case CipherSuiteChaCha20Poly1305SHA256:
+		return rekeyChaChaPoly(base, nextSecret)
+	default:
+		return nil, ErrUnsupportedCipherSuite
+	}
+}
+
+func rekeyAESGCM(h func() hash.Hash, keyLen int, base *PacketProtection, secret []byte) (*PacketProtection, error) {
+	key, err := hkdfExpandLabelHash(h, secret, "quic key", keyLen)
+	if err != nil {
+		return nil, err
+	}
+	iv, err := hkdfExpandLabelHash(h, secret, "quic iv", 12)
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	return &PacketProtection{
+		AEAD:       aead,
+		IV:         iv,
+		headerMask: base.headerMask,
+	}, nil
+}
+
+func rekeyChaChaPoly(base *PacketProtection, secret []byte) (*PacketProtection, error) {
+	key, err := hkdfExpandLabelHash(sha256.New, secret, "quic key", 32)
+	if err != nil {
+		return nil, err
+	}
+	iv, err := hkdfExpandLabelHash(sha256.New, secret, "quic iv", 12)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, err
+	}
+	return &PacketProtection{
+		AEAD:       aead,
+		IV:         iv,
+		headerMask: base.headerMask,
+	}, nil
+}
+
 // hkdfExpandLabelHash implements HKDF-Expand-Label (TLS 1.3 §7.1) with a
 // caller-supplied hash function. The original quic_keys.go retains
 // hkdfExpandLabel as a SHA-256 shim used by the Initial code path.

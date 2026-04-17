@@ -14,6 +14,8 @@ const (
 	FrameTypePing               uint64 = 0x01
 	FrameTypeAck                uint64 = 0x02
 	FrameTypeAckECN             uint64 = 0x03
+	FrameTypeResetStream        uint64 = 0x04
+	FrameTypeStopSending        uint64 = 0x05
 	FrameTypeCrypto             uint64 = 0x06
 	FrameTypeNewToken           uint64 = 0x07
 	FrameTypeStreamBase         uint64 = 0x08
@@ -135,6 +137,48 @@ type NewTokenFrame struct {
 
 func (NewTokenFrame) frameType() uint64 { return FrameTypeNewToken }
 
+// MaxDataFrame raises the connection-level send credit (RFC 9000
+// §19.9). Maximum is the absolute byte offset across all streams the
+// receiver authorises the sender to deliver.
+type MaxDataFrame struct {
+	Maximum uint64
+}
+
+func (MaxDataFrame) frameType() uint64 { return FrameTypeMaxData }
+
+// MaxStreamDataFrame raises a single stream's send credit (RFC 9000
+// §19.10). Maximum is the absolute byte offset on StreamID the
+// receiver authorises the sender to deliver.
+type MaxStreamDataFrame struct {
+	StreamID uint64
+	Maximum  uint64
+}
+
+func (MaxStreamDataFrame) frameType() uint64 { return FrameTypeMaxStreamData }
+
+// ResetStreamFrame is the RESET_STREAM frame (RFC 9000 §19.4): the
+// sender abruptly terminates the sending part of a stream. ErrorCode
+// is application-defined; FinalSize is the absolute byte offset the
+// peer has now committed to.
+type ResetStreamFrame struct {
+	StreamID  uint64
+	ErrorCode uint64
+	FinalSize uint64
+}
+
+func (ResetStreamFrame) frameType() uint64 { return FrameTypeResetStream }
+
+// StopSendingFrame is the STOP_SENDING frame (RFC 9000 §19.5): the
+// receiver asks the peer to stop sending on a stream. The peer is
+// expected to respond with RESET_STREAM. ErrorCode is application-
+// defined.
+type StopSendingFrame struct {
+	StreamID  uint64
+	ErrorCode uint64
+}
+
+func (StopSendingFrame) frameType() uint64 { return FrameTypeStopSending }
+
 // ParseFrames walks payload, returning every frame in order. Padding
 // runs are coalesced into a single PaddingFrame for convenience. The
 // caller is responsible for enforcing per-encryption-level frame
@@ -214,8 +258,14 @@ func ParseFrames(payload []byte) ([]Frame, error) {
 			payload = rest
 		case t == FrameTypeHandshakeDone:
 			frames = append(frames, HandshakeDoneFrame{})
-		case t == FrameTypeMaxData,
-			t == FrameTypeMaxStreamsBidi,
+		case t == FrameTypeMaxData:
+			max, n, err := ReadVarInt(payload)
+			if err != nil {
+				return nil, err
+			}
+			frames = append(frames, MaxDataFrame{Maximum: max})
+			payload = payload[n:]
+		case t == FrameTypeMaxStreamsBidi,
 			t == FrameTypeMaxStreamsUni,
 			t == FrameTypeDataBlocked,
 			t == FrameTypeStreamsBlockedBidi,
@@ -226,7 +276,18 @@ func ParseFrames(payload []byte) ([]Frame, error) {
 				return nil, err
 			}
 			payload = payload[n:]
-		case t == FrameTypeMaxStreamData, t == FrameTypeStreamDataBlocked:
+		case t == FrameTypeMaxStreamData:
+			id, n1, err := ReadVarInt(payload)
+			if err != nil {
+				return nil, err
+			}
+			max, n2, err := ReadVarInt(payload[n1:])
+			if err != nil {
+				return nil, err
+			}
+			frames = append(frames, MaxStreamDataFrame{StreamID: id, Maximum: max})
+			payload = payload[n1+n2:]
+		case t == FrameTypeStreamDataBlocked:
 			_, n1, err := ReadVarInt(payload)
 			if err != nil {
 				return nil, err
@@ -235,6 +296,32 @@ func ParseFrames(payload []byte) ([]Frame, error) {
 			if err != nil {
 				return nil, err
 			}
+			payload = payload[n1+n2:]
+		case t == FrameTypeResetStream:
+			id, n1, err := ReadVarInt(payload)
+			if err != nil {
+				return nil, err
+			}
+			ec, n2, err := ReadVarInt(payload[n1:])
+			if err != nil {
+				return nil, err
+			}
+			fs, n3, err := ReadVarInt(payload[n1+n2:])
+			if err != nil {
+				return nil, err
+			}
+			frames = append(frames, ResetStreamFrame{StreamID: id, ErrorCode: ec, FinalSize: fs})
+			payload = payload[n1+n2+n3:]
+		case t == FrameTypeStopSending:
+			id, n1, err := ReadVarInt(payload)
+			if err != nil {
+				return nil, err
+			}
+			ec, n2, err := ReadVarInt(payload[n1:])
+			if err != nil {
+				return nil, err
+			}
+			frames = append(frames, StopSendingFrame{StreamID: id, ErrorCode: ec})
 			payload = payload[n1+n2:]
 		case t == FrameTypePathChallenge, t == FrameTypePathResponse:
 			if len(payload) < 8 {
@@ -266,6 +353,17 @@ func parseAck(payload []byte, ecn bool) (AckFrame, []byte, error) {
 		return AckFrame{}, nil, err
 	}
 	off := n1 + n2 + n3 + n4
+	// Sanity bound: a varint can encode up to 2^62 - 1, far more than
+	// any legitimate ACK frame contains. Cap the preallocation at the
+	// number of varint pairs the remaining payload could possibly
+	// hold (one byte minimum per varint, so two bytes per range).
+	// Without this cap a hostile peer can crash the parser via a
+	// ranges-count of 2^62 making make() panic with "cap out of
+	// range".
+	maxPossible := uint64(len(payload)-off) / 2
+	if rangeCount > maxPossible {
+		return AckFrame{}, nil, ErrFrameTruncated
+	}
 	ranges := make([]AckRange, 0, rangeCount)
 	for i := uint64(0); i < rangeCount; i++ {
 		gap, gn, err := ReadVarInt(payload[off:])
@@ -465,6 +563,33 @@ func AppendAckFrameRanges(b []byte, ackDelay uint64, descending []uint64) []byte
 	return b
 }
 
+// AppendAckFrameFromBitmap appends an ACK frame derived from a
+// sliding-window bitmap. last is the highest packet number known
+// received; bitmap bit i is set when (last - i) was received. The
+// helper short-circuits to AppendAckFrameRanges, exercising the same
+// gap/range encoder so the wire result is identical to the explicit
+// path used by tests.
+//
+// AppendAckFrameFromBitmap is intended for receivers that track ACK
+// state with a single 64-bit window instead of a per-PN map; it
+// performs no allocation beyond the appended bytes.
+func AppendAckFrameFromBitmap(b []byte, ackDelay uint64, last uint64, bitmap uint64) []byte {
+	if bitmap == 0 {
+		return b
+	}
+	pns := make([]uint64, 0, 64)
+	for i := uint64(0); i < 64; i++ {
+		if bitmap&(uint64(1)<<i) == 0 {
+			continue
+		}
+		if i > last {
+			break
+		}
+		pns = append(pns, last-i)
+	}
+	return AppendAckFrameRanges(b, ackDelay, pns)
+}
+
 // AppendStreamFrame appends a STREAM frame. The OFF and LEN bits are
 // always set so the frame can sit anywhere in a packet payload; FIN is
 // set when fin is true.
@@ -491,6 +616,73 @@ func AppendPaddingFrames(b []byte, n int) []byte {
 	for i := 0; i < n; i++ {
 		b = append(b, 0x00)
 	}
+	return b
+}
+
+// AppendMaxDataFrame appends a MAX_DATA frame (RFC 9000 §19.9) raising
+// the receiver's connection-level send credit to maximum.
+func AppendMaxDataFrame(b []byte, maximum uint64) []byte {
+	b = AppendVarInt(b, FrameTypeMaxData)
+	b = AppendVarInt(b, maximum)
+	return b
+}
+
+// AppendMaxStreamDataFrame appends a MAX_STREAM_DATA frame (RFC 9000
+// §19.10) raising streamID's send credit to maximum.
+func AppendMaxStreamDataFrame(b []byte, streamID, maximum uint64) []byte {
+	b = AppendVarInt(b, FrameTypeMaxStreamData)
+	b = AppendVarInt(b, streamID)
+	b = AppendVarInt(b, maximum)
+	return b
+}
+
+// AppendDataBlockedFrame appends a DATA_BLOCKED frame (RFC 9000
+// §19.12) reporting that the sender has data to send but is blocked by
+// the connection-level flow control limit.
+func AppendDataBlockedFrame(b []byte, limit uint64) []byte {
+	b = AppendVarInt(b, FrameTypeDataBlocked)
+	b = AppendVarInt(b, limit)
+	return b
+}
+
+// AppendStreamDataBlockedFrame appends a STREAM_DATA_BLOCKED frame
+// (RFC 9000 §19.13) reporting that streamID is blocked by the
+// stream-level flow control limit.
+func AppendStreamDataBlockedFrame(b []byte, streamID, limit uint64) []byte {
+	b = AppendVarInt(b, FrameTypeStreamDataBlocked)
+	b = AppendVarInt(b, streamID)
+	b = AppendVarInt(b, limit)
+	return b
+}
+
+// AppendResetStreamFrame appends a RESET_STREAM frame (RFC 9000 §19.4).
+// errorCode is application-defined; finalSize is the absolute stream
+// offset at which the sender stops emitting bytes.
+func AppendResetStreamFrame(b []byte, streamID, errorCode, finalSize uint64) []byte {
+	b = AppendVarInt(b, FrameTypeResetStream)
+	b = AppendVarInt(b, streamID)
+	b = AppendVarInt(b, errorCode)
+	b = AppendVarInt(b, finalSize)
+	return b
+}
+
+// AppendRetireConnectionIDFrame appends a RETIRE_CONNECTION_ID frame
+// (RFC 9000 §19.16). The receiver is expected to stop using the
+// connection ID with the given sequence number and remove it from
+// its issued set.
+func AppendRetireConnectionIDFrame(b []byte, sequenceNumber uint64) []byte {
+	b = AppendVarInt(b, FrameTypeRetireConnectionID)
+	b = AppendVarInt(b, sequenceNumber)
+	return b
+}
+
+// AppendStopSendingFrame appends a STOP_SENDING frame (RFC 9000 §19.5).
+// errorCode is application-defined and indicates why the receiver no
+// longer wants to read.
+func AppendStopSendingFrame(b []byte, streamID, errorCode uint64) []byte {
+	b = AppendVarInt(b, FrameTypeStopSending)
+	b = AppendVarInt(b, streamID)
+	b = AppendVarInt(b, errorCode)
 	return b
 }
 

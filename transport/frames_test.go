@@ -38,6 +38,39 @@ func TestAppendCryptoNonZeroOffset(t *testing.T) {
 	}
 }
 
+func TestAppendResetStreamRoundTrip(t *testing.T) {
+	enc := AppendResetStreamFrame(nil, 4, 0x101, 12345)
+	frames, err := ParseFrames(enc)
+	if err != nil {
+		t.Fatalf("ParseFrames: %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("len=%d want 1", len(frames))
+	}
+	rs, ok := frames[0].(ResetStreamFrame)
+	if !ok {
+		t.Fatalf("type %T", frames[0])
+	}
+	if rs.StreamID != 4 || rs.ErrorCode != 0x101 || rs.FinalSize != 12345 {
+		t.Fatalf("got %+v", rs)
+	}
+}
+
+func TestAppendStopSendingRoundTrip(t *testing.T) {
+	enc := AppendStopSendingFrame(nil, 8, 0x42)
+	frames, err := ParseFrames(enc)
+	if err != nil {
+		t.Fatalf("ParseFrames: %v", err)
+	}
+	ss, ok := frames[0].(StopSendingFrame)
+	if !ok {
+		t.Fatalf("type %T", frames[0])
+	}
+	if ss.StreamID != 8 || ss.ErrorCode != 0x42 {
+		t.Fatalf("got %+v", ss)
+	}
+}
+
 func TestAppendStreamRoundTripWithFin(t *testing.T) {
 	data := []byte("hello mirage")
 	enc := AppendStreamFrame(nil, 4, 0, data, true)
@@ -155,6 +188,23 @@ func TestParseNewConnectionID(t *testing.T) {
 	}
 }
 
+func TestAppendRetireConnectionIDFrame(t *testing.T) {
+	enc := AppendRetireConnectionIDFrame(nil, 7)
+	if len(enc) < 2 || enc[0] != 0x19 {
+		t.Fatalf("expected leading byte 0x19, got %x", enc)
+	}
+	// Walk through ParseFrames; the parser drops the value and
+	// returns no Frame for RETIRE_CONNECTION_ID. The success
+	// signal is "no error and full payload consumed".
+	frames, err := ParseFrames(enc)
+	if err != nil {
+		t.Fatalf("ParseFrames: %v", err)
+	}
+	if len(frames) != 0 {
+		t.Fatalf("expected RETIRE_CONNECTION_ID to parse silently, got %+v", frames)
+	}
+}
+
 func TestParseNewToken(t *testing.T) {
 	body := []byte{0x07, 0x03, 'a', 'b', 'c'}
 	frames, err := ParseFrames(body)
@@ -245,6 +295,108 @@ func TestAppendAckFrameRangesGaps(t *testing.T) {
 
 func TestAppendAckFrameRangesEmpty(t *testing.T) {
 	if got := AppendAckFrameRanges(nil, 0, nil); len(got) != 0 {
+		t.Fatalf("want empty, got %d bytes", len(got))
+	}
+}
+
+func TestAppendAckFrameFromBitmapContiguous(t *testing.T) {
+	// last=5, bitmap covers 5..0
+	bitmap := uint64(0b111111)
+	enc := AppendAckFrameFromBitmap(nil, 0, 5, bitmap)
+	frames, err := ParseFrames(enc)
+	if err != nil {
+		t.Fatalf("ParseFrames: %v", err)
+	}
+	a := frames[0].(AckFrame)
+	if a.LargestAcked != 5 || a.FirstAckLen != 5 {
+		t.Fatalf("got %+v", a)
+	}
+	if len(a.Ranges) != 0 {
+		t.Fatalf("ranges=%d want 0", len(a.Ranges))
+	}
+}
+
+func TestAppendAckFrameFromBitmapWithGap(t *testing.T) {
+	// last=10; received {10, 9, 7, 6, 3} → bitmap bits {0,1,3,4,7}.
+	bits := []uint{0, 1, 3, 4, 7}
+	var bitmap uint64
+	for _, b := range bits {
+		bitmap |= uint64(1) << b
+	}
+	enc := AppendAckFrameFromBitmap(nil, 0, 10, bitmap)
+	frames, err := ParseFrames(enc)
+	if err != nil {
+		t.Fatalf("ParseFrames: %v", err)
+	}
+	a := frames[0].(AckFrame)
+	if a.LargestAcked != 10 || a.FirstAckLen != 1 {
+		t.Fatalf("first run: %+v", a)
+	}
+	if len(a.Ranges) != 2 {
+		t.Fatalf("ranges=%d want 2", len(a.Ranges))
+	}
+}
+
+func TestAppendMaxDataRoundTrip(t *testing.T) {
+	enc := AppendMaxDataFrame(nil, 1<<20)
+	frames, err := ParseFrames(enc)
+	if err != nil {
+		t.Fatalf("ParseFrames: %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("len=%d want 1", len(frames))
+	}
+	mf, ok := frames[0].(MaxDataFrame)
+	if !ok {
+		t.Fatalf("type %T", frames[0])
+	}
+	if mf.Maximum != 1<<20 {
+		t.Fatalf("got %+v", mf)
+	}
+}
+
+func TestAppendMaxStreamDataRoundTrip(t *testing.T) {
+	enc := AppendMaxStreamDataFrame(nil, 4, 1<<18)
+	frames, err := ParseFrames(enc)
+	if err != nil {
+		t.Fatalf("ParseFrames: %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("len=%d want 1", len(frames))
+	}
+	mf, ok := frames[0].(MaxStreamDataFrame)
+	if !ok {
+		t.Fatalf("type %T", frames[0])
+	}
+	if mf.StreamID != 4 || mf.Maximum != 1<<18 {
+		t.Fatalf("got %+v", mf)
+	}
+}
+
+func TestAppendDataBlockedFrameSkipped(t *testing.T) {
+	enc := AppendDataBlockedFrame(nil, 4096)
+	frames, err := ParseFrames(enc)
+	if err != nil {
+		t.Fatalf("ParseFrames: %v", err)
+	}
+	if len(frames) != 0 {
+		t.Fatalf("DATA_BLOCKED is consumed silently; got %d frames", len(frames))
+	}
+}
+
+func TestAppendStreamDataBlockedFrameSkipped(t *testing.T) {
+	enc := AppendStreamDataBlockedFrame(nil, 4, 8192)
+	frames, err := ParseFrames(enc)
+	if err != nil {
+		t.Fatalf("ParseFrames: %v", err)
+	}
+	if len(frames) != 0 {
+		t.Fatalf("STREAM_DATA_BLOCKED is consumed silently; got %d frames", len(frames))
+	}
+}
+
+func TestAppendAckFrameFromBitmapEmpty(t *testing.T) {
+	if got := AppendAckFrameFromBitmap(nil, 0, 0, 0); len(got) != 0 {
 		t.Fatalf("want empty, got %d bytes", len(got))
 	}
 }

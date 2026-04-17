@@ -63,6 +63,73 @@ func TestShortHeaderRejectsLongHeader(t *testing.T) {
 	}
 }
 
+func TestShortHeaderKeyUpdateUsesNextPP(t *testing.T) {
+	secret := bytes.Repeat([]byte{0x99}, 32)
+	current, err := DerivePacketProtection(CipherSuiteAES128GCMSHA256, secret)
+	if err != nil {
+		t.Fatalf("DerivePacketProtection: %v", err)
+	}
+	nextSecret, err := NextAppSecret(CipherSuiteAES128GCMSHA256, secret)
+	if err != nil {
+		t.Fatalf("NextAppSecret: %v", err)
+	}
+	next, err := RekeyForUpdate(CipherSuiteAES128GCMSHA256, current, nextSecret)
+	if err != nil {
+		t.Fatalf("RekeyForUpdate: %v", err)
+	}
+	dcid := bytes.Repeat([]byte{0xCC}, 8)
+
+	// Sender flips key phase and uses the rotated AEAD.
+	pkt, err := BuildShortHeader(dcid, 42, []byte{0x01}, true, next)
+	if err != nil {
+		t.Fatalf("BuildShortHeader: %v", err)
+	}
+	parsed, used, err := ParseShortHeaderWithUpdate(pkt, len(dcid), current, next, false)
+	if err != nil {
+		t.Fatalf("ParseShortHeaderWithUpdate: %v", err)
+	}
+	if !used {
+		t.Fatal("usedNext should be true after key phase flip")
+	}
+	if !parsed.KeyPhase {
+		t.Fatal("parsed.KeyPhase should reflect the flipped bit")
+	}
+	if parsed.PacketNumber != 42 {
+		t.Fatalf("pn = %d", parsed.PacketNumber)
+	}
+}
+
+func TestShortHeaderKeyUpdateRequiresNextPP(t *testing.T) {
+	secret := bytes.Repeat([]byte{0xAA}, 32)
+	current, _ := DerivePacketProtection(CipherSuiteAES128GCMSHA256, secret)
+	nextSecret, _ := NextAppSecret(CipherSuiteAES128GCMSHA256, secret)
+	next, _ := RekeyForUpdate(CipherSuiteAES128GCMSHA256, current, nextSecret)
+	dcid := bytes.Repeat([]byte{0xBB}, 8)
+	pkt, _ := BuildShortHeader(dcid, 1, []byte{0x01}, true, next)
+	if _, _, err := ParseShortHeaderWithUpdate(pkt, len(dcid), current, nil, false); err != ErrAEADAuthFailed {
+		t.Fatalf("got %v want ErrAEADAuthFailed without next pp", err)
+	}
+}
+
+func TestShortHeaderKeyUpdateNoFlipUsesCurrent(t *testing.T) {
+	secret := bytes.Repeat([]byte{0xDD}, 32)
+	current, _ := DerivePacketProtection(CipherSuiteAES128GCMSHA256, secret)
+	nextSecret, _ := NextAppSecret(CipherSuiteAES128GCMSHA256, secret)
+	next, _ := RekeyForUpdate(CipherSuiteAES128GCMSHA256, current, nextSecret)
+	dcid := bytes.Repeat([]byte{0xEE}, 8)
+	pkt, _ := BuildShortHeader(dcid, 7, []byte{0x01}, false, current)
+	parsed, used, err := ParseShortHeaderWithUpdate(pkt, len(dcid), current, next, false)
+	if err != nil {
+		t.Fatalf("ParseShortHeaderWithUpdate: %v", err)
+	}
+	if used {
+		t.Fatal("usedNext should be false when key phase matches")
+	}
+	if parsed.PacketNumber != 7 {
+		t.Fatalf("pn = %d", parsed.PacketNumber)
+	}
+}
+
 func TestShortHeaderRejectsBadAEAD(t *testing.T) {
 	secret := bytes.Repeat([]byte{0x77}, 32)
 	pp, _ := DerivePacketProtection(CipherSuiteAES128GCMSHA256, secret)

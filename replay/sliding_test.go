@@ -87,6 +87,39 @@ func TestSlidingWindowSmallWidth(t *testing.T) {
 	}
 }
 
+func TestSlidingWindowSnapshotEmpty(t *testing.T) {
+	w := NewSlidingWindow(64)
+	last, bm, seeded := w.Snapshot()
+	if seeded || last != 0 || bm != 0 {
+		t.Fatalf("empty snapshot: last=%d bm=%x seeded=%v", last, bm, seeded)
+	}
+}
+
+func TestSlidingWindowSnapshotMatchesAccepted(t *testing.T) {
+	w := NewSlidingWindow(64)
+	for _, s := range []uint64{0, 1, 2, 4, 7} {
+		if !w.Check(s) {
+			t.Fatalf("Check(%d) rejected", s)
+		}
+	}
+	last, bm, seeded := w.Snapshot()
+	if !seeded {
+		t.Fatal("snapshot reports !seeded after Check")
+	}
+	if last != 7 {
+		t.Fatalf("last=%d want 7", last)
+	}
+	// Bits set: 0 (=7), 3 (=4), 5 (=2), 6 (=1), 7 (=0).
+	wantBits := []uint{0, 3, 5, 6, 7}
+	var want uint64
+	for _, b := range wantBits {
+		want |= uint64(1) << b
+	}
+	if bm != want {
+		t.Fatalf("bm=%b want %b", bm, want)
+	}
+}
+
 func TestSlidingWindowConcurrent(t *testing.T) {
 	// Launch many goroutines sharing the same window. Each picks a
 	// disjoint seq range so no duplicates exist; we only assert that no

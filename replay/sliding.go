@@ -71,3 +71,16 @@ func (w *SlidingWindow) Last() uint64 {
 	defer w.mu.Unlock()
 	return w.last
 }
+
+// Snapshot returns the current state. seeded reports whether the window
+// has accepted at least one sequence number; bitmap is the bit-i-set =
+// seq (last - i) is present representation used by Check.
+//
+// Snapshot is intended for receivers that need to re-encode a packet
+// number set (for example as a QUIC ACK frame) without keeping a
+// separate map of received PNs in addition to the window.
+func (w *SlidingWindow) Snapshot() (last uint64, bitmap uint64, seeded bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.last, w.bitmap, w.seeded
+}
