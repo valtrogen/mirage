@@ -12,8 +12,11 @@ packets are forwarded byte-for-byte to a real CDN endpoint via a
 stateless 4-tuple UDP relay, so active probes see the real CDN's
 certificate and response.
 
-The data plane uses standard BBRv2, Chrome HTTP/3 timings (PING, PMTU,
-ACK delay), and Chrome's empirical packet-size distribution. Long-lived
+The data plane uses the host `quic-go` build's default congestion
+controller (a naturally oscillating, sawtooth-shaped CC such as CUBIC
+or BBR — see `docs/spec.md` §6.1 for why a specific algorithm is not
+mandated), Chrome HTTP/3 timings (PING, PMTU, ACK delay), and Chrome's
+empirical packet-size distribution. Long-lived
 connections are rotated at jittered thresholds (default 90-180 min or
 3-8 GiB) to avoid the "single connection, many gigabytes, hours" tell.
 
@@ -28,7 +31,6 @@ handshake/   REALITY-over-QUIC handshake + 4-tuple UDP relay
 replay/      time-window key derivation + sliding-window anti-replay
 transport/   QUIC integration layer
 behavior/    Chrome HTTP/3 timing constants
-padder/      BBR-aware idle padding
 recycle/     connection rotation
 adapter/     interfaces decoupling the protocol from the host system
 examples/    minimal reference server and client

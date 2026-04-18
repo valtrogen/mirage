@@ -1,4 +1,5 @@
-// Package transport wraps the underlying QUIC stack with the hooks
-// mirage needs: Initial packet interception, behavior-alignment knobs,
-// and congestion-controller signals for the padder.
+// Package transport holds the server-side helpers for parsing and
+// decrypting QUIC long-header Initial packets: HKDF-derived initial
+// keys, ClientHello reassembly from CRYPTO frames, and varint helpers
+// shared with the dispatcher.
 package transport

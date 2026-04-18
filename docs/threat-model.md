@@ -48,19 +48,33 @@ We explicitly do *not* model:
 
 ### P1. Indistinguishability from a Chrome H3 baseline (vs. A)
 The on-wire bytes — packet sizes, ALPN, TLS extensions, QUIC transport
-parameters, GREASE patterns, congestion-control behaviour — match an
-unmodified Chrome connection to a major CDN.
+parameters, GREASE patterns, frame layout in the first Initial — match
+an unmodified Chrome connection to a major CDN. Congestion-control
+behaviour matches the broader mixed-CC pool of real H3 traffic on the
+internet rather than Chrome's specific BBRv2 instance; see `spec.md`
+§6.1 for the rationale.
 
 **Mechanism**
 - TLS ClientHello / ServerHello use the same cipher list, extension
-  order, and GREASE values as Chrome stable (see `behavior/chrome_h3.go`).
-- Initial datagram padding is sampled from the Chrome-baseline
-  distribution (`behavior.PadderPolicy`).
-- Congestion control uses BBRv2 with the same limits Chrome ships
-  (`congestion/bbr2`).
+  order, and GREASE values as Chrome stable. The reference client uses
+  the `QUICChrome_115` spec from `refraction-networking/uquic`, which
+  also reproduces the random CRYPTO/PING/PADDING frame layout Chrome
+  emits in its first Initial datagram.
+- The encrypted short-id is re-stamped into `legacy_session_id` after
+  uTLS would otherwise zero it (see `_vendor/uquic/MIRAGE_PATCH.md`),
+  so the ClientHello size and digest stay on Chrome's distribution.
+- Transport parameters (`max_idle_timeout`, `max_ack_delay`,
+  `initial_max_*`, `active_connection_id_limit`, etc.) are pinned to
+  Chrome stable values in `behavior/chrome_h3.go`.
+- Congestion control is whatever the host `quic-go` build ships
+  (CUBIC at the time of writing). The data-plane shape is loss- or
+  RTT-driven sawtooth, never Brutal-style flat-top. See `spec.md` §6.1.
 - The destination connection ID is rotated periodically (default 5 min,
   see `behavior.ChromeH3.CIDRotateInterval`) so long-lived flows do not
   expose a unique identifier across NAT rebinding events.
+- Long-lived high-volume connections rotate via the recycle hint
+  (see `recycle/`) so neither lifetime nor cumulative byte count
+  exceeds the empirical envelope of real CDN flows.
 
 **Residual risk** Operators must keep the binary in step with the
 current Chrome stable channel; a stale fingerprint becomes a unique

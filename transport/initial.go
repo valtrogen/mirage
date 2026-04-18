@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
+	"sort"
 )
 
 // QUICv1 is the QUIC version 1 number (RFC 9000).
@@ -206,44 +207,153 @@ func computeHeaderMask(hpKey, sample []byte) ([5]byte, error) {
 }
 
 // ExtractCRYPTOData walks the QUIC frames in payload and returns the
-// contiguous CRYPTO data starting at offset 0. It silently skips PADDING
-// (0x00) and PING (0x01) frames. Any unknown frame type or a non-zero
-// starting offset stops the walk and returns whatever has been collected
-// so far.
+// contiguous CRYPTO byte stream starting at offset 0.
+//
+// Initial packets are allowed to carry CRYPTO frames in any order and
+// to interleave them with PADDING, PING, ACK and CONNECTION_CLOSE
+// frames (RFC 9000 §17.2.2). Real Chrome additionally splits its
+// ClientHello across several CRYPTO frames and shuffles the entire
+// frame list, so a strict in-order parser would misclassify Chrome
+// traffic as non-mirage. We collect every CRYPTO fragment we can find
+// and reassemble them by offset.
+//
+// On a structural error (truncated frame, varint decode failure) the
+// reassembly stops and whatever contiguous prefix is available is
+// returned together with ErrTruncatedPacket. Unknown / unexpected
+// frame types stop the walk silently and return the prefix we have so
+// far, so callers using this on best-effort dispatch paths can still
+// decide based on the leading ClientHello bytes.
 func ExtractCRYPTOData(payload []byte) ([]byte, error) {
-	var out []byte
-	expected := uint64(0)
+	var fragments []cryptoFragment
 	for i := 0; i < len(payload); {
 		t := payload[i]
 		switch t {
-		case 0x00:
+		case 0x00, 0x01:
+			// PADDING / PING: single byte, no fields.
 			i++
-		case 0x01:
+		case 0x02, 0x03:
+			// ACK / ACK_ECN. We don't need the ranges, just to skip
+			// past the frame so we can keep reading what follows.
 			i++
+			n, ok := skipACK(payload[i:], t == 0x03)
+			if !ok {
+				return reassemble(fragments), ErrTruncatedPacket
+			}
+			i += n
 		case 0x06:
+			// CRYPTO frame: offset (varint), length (varint), bytes.
 			i++
 			off, n, err := ReadVarInt(payload[i:])
 			if err != nil {
-				return out, err
+				return reassemble(fragments), err
 			}
 			i += n
 			length, n, err := ReadVarInt(payload[i:])
 			if err != nil {
-				return out, err
+				return reassemble(fragments), err
 			}
 			i += n
 			if uint64(i)+length > uint64(len(payload)) {
-				return out, ErrTruncatedPacket
+				return reassemble(fragments), ErrTruncatedPacket
 			}
-			if off != expected {
-				return out, nil
-			}
-			out = append(out, payload[i:i+int(length)]...)
-			expected += length
+			fragments = append(fragments, cryptoFragment{
+				off:  off,
+				data: payload[i : i+int(length)],
+			})
 			i += int(length)
+		case 0x1c, 0x1d:
+			// CONNECTION_CLOSE: the rest of the packet is opaque to
+			// us; stop and return whatever CRYPTO we have already
+			// reassembled.
+			return reassemble(fragments), nil
 		default:
-			return out, nil
+			return reassemble(fragments), nil
 		}
 	}
-	return out, nil
+	return reassemble(fragments), nil
+}
+
+// cryptoFragment is one decoded CRYPTO frame body together with its
+// stream offset, used by the Initial-packet reassembler.
+type cryptoFragment struct {
+	off  uint64
+	data []byte
+}
+
+// reassemble joins fragments into a single byte slice covering the
+// contiguous range starting at offset 0. Any gap stops the walk.
+func reassemble(fragments []cryptoFragment) []byte {
+	if len(fragments) == 0 {
+		return nil
+	}
+	sort.Slice(fragments, func(i, j int) bool {
+		return fragments[i].off < fragments[j].off
+	})
+	var out []byte
+	expected := uint64(0)
+	for _, f := range fragments {
+		switch {
+		case f.off+uint64(len(f.data)) <= expected:
+			// Fully duplicated suffix; drop.
+		case f.off > expected:
+			// Hole: cannot deliver beyond this point.
+			return out
+		case f.off == expected:
+			out = append(out, f.data...)
+			expected += uint64(len(f.data))
+		default:
+			// Overlap on the left edge; trim and append.
+			start := expected - f.off
+			out = append(out, f.data[start:]...)
+			expected += uint64(len(f.data)) - start
+		}
+	}
+	return out
+}
+
+// skipACK advances past the body of an ACK or ACK_ECN frame whose type
+// byte has already been consumed. It returns the number of bytes
+// consumed from buf and true on success. ACK frames are extremely
+// rare in client→server Initial packets but cheap to support, and
+// supporting them keeps the dispatcher robust against unusual
+// implementations.
+func skipACK(buf []byte, withECN bool) (int, bool) {
+	off := 0
+	advance := func() (uint64, bool) {
+		v, n, err := ReadVarInt(buf[off:])
+		if err != nil {
+			return 0, false
+		}
+		off += n
+		return v, true
+	}
+	if _, ok := advance(); !ok { // largest acknowledged
+		return 0, false
+	}
+	if _, ok := advance(); !ok { // ack delay
+		return 0, false
+	}
+	rangeCount, ok := advance() // ack range count
+	if !ok {
+		return 0, false
+	}
+	if _, ok := advance(); !ok { // first ack range
+		return 0, false
+	}
+	for j := uint64(0); j < rangeCount; j++ {
+		if _, ok := advance(); !ok { // gap
+			return 0, false
+		}
+		if _, ok := advance(); !ok { // ack range length
+			return 0, false
+		}
+	}
+	if withECN {
+		for k := 0; k < 3; k++ { // ECT0, ECT1, ECN-CE counts
+			if _, ok := advance(); !ok {
+				return 0, false
+			}
+		}
+	}
+	return off, true
 }

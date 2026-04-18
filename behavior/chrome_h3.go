@@ -1,6 +1,10 @@
 package behavior
 
-import "time"
+import (
+	"time"
+
+	"github.com/quic-go/quic-go"
+)
 
 // ChromeH3 is the set of timing, sizing, and flow-control constants we
 // align with so that a mirage QUIC connection looks, on the wire, like a
@@ -128,4 +132,43 @@ func Default() ChromeH3 {
 // ChromeH3.
 func (c ChromeH3) IsZero() bool {
 	return c == ChromeH3{}
+}
+
+// ApplyToQUICConfig fills in the server-side quic-go configuration
+// from cfg so that the values quic-go puts on the wire match Chrome
+// HTTP/3. Fields the caller has already set to a non-zero value are
+// preserved so that explicit overrides win.
+func ApplyToQUICConfig(qc *quic.Config, cfg ChromeH3) {
+	if qc == nil {
+		return
+	}
+	if qc.HandshakeIdleTimeout == 0 {
+		qc.HandshakeIdleTimeout = cfg.HandshakeIdleTimeout
+	}
+	if qc.MaxIdleTimeout == 0 {
+		qc.MaxIdleTimeout = cfg.MaxIdleTimeout
+	}
+	if qc.InitialStreamReceiveWindow == 0 {
+		qc.InitialStreamReceiveWindow = cfg.InitialMaxStreamDataBidiRemote
+	}
+	if qc.MaxStreamReceiveWindow == 0 {
+		qc.MaxStreamReceiveWindow = cfg.MaxStreamReceiveWindow
+	}
+	if qc.InitialConnectionReceiveWindow == 0 {
+		qc.InitialConnectionReceiveWindow = cfg.InitialMaxData
+	}
+	if qc.MaxConnectionReceiveWindow == 0 {
+		qc.MaxConnectionReceiveWindow = cfg.MaxConnectionReceiveWindow
+	}
+	if qc.MaxIncomingStreams == 0 {
+		qc.MaxIncomingStreams = int64(cfg.InitialMaxStreamsBidi)
+	}
+	if qc.MaxIncomingUniStreams == 0 {
+		qc.MaxIncomingUniStreams = int64(cfg.InitialMaxStreamsUni)
+	}
+	if qc.InitialPacketSize == 0 {
+		qc.InitialPacketSize = cfg.PMTUInitial
+	}
+	// Chrome does not rely on QUIC keep-alive; the application layer
+	// emits PINGs. Leave qc.KeepAlivePeriod untouched.
 }

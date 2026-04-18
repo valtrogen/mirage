@@ -28,10 +28,6 @@ const (
 	// after sending the hint, then refuses new streams; in-flight
 	// streams drain until they complete or a hard timeout fires.
 	FrameTypeConnectionRecycleHint FrameType = 0x01
-
-	// FrameTypeKeepalivePadding carries opaque bytes used to fill in
-	// idle gaps. Bodies must be discarded by the receiver.
-	FrameTypeKeepalivePadding FrameType = 0x02
 )
 
 // FrameHeaderLen is the size of a control-stream frame header

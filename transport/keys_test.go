@@ -179,7 +179,7 @@ func TestRekeyForUpdateChaChaPoly(t *testing.T) {
 	}
 }
 
-func TestHkdfExpandLabelHashConsistentWithLegacy(t *testing.T) {
+func TestHkdfExpandLabelHashRFC9001Vector(t *testing.T) {
 	got, err := hkdfExpandLabelHash(sha256.New, rfc9001ClientInitialSecret, "quic key", 16)
 	if err != nil {
 		t.Fatalf("hkdfExpandLabelHash: %v", err)

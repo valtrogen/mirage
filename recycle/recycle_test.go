@@ -115,14 +115,15 @@ func TestDecodeHintBodyLen(t *testing.T) {
 func TestFrameRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	body := []byte{0xDE, 0xAD, 0xBE, 0xEF}
-	if err := WriteFrame(&buf, proto.FrameTypeKeepalivePadding, body); err != nil {
+	const ft = proto.FrameType(0x7F)
+	if err := WriteFrame(&buf, ft, body); err != nil {
 		t.Fatal(err)
 	}
 	gotType, gotBody, err := ReadFrame(&buf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotType != proto.FrameTypeKeepalivePadding {
+	if gotType != ft {
 		t.Fatalf("type %v", gotType)
 	}
 	if !bytes.Equal(gotBody, body) {

@@ -4,9 +4,8 @@
 //
 // The schema is intentionally narrow: it only covers parameters that
 // operators *must* be able to change without recompiling. Anything
-// else (Authenticator implementation, custom Authorizer, custom
-// PadderPolicy) is wired by the calling binary because it is code
-// rather than data.
+// else (Authenticator implementation, custom Authorizer) is wired by
+// the calling binary because it is code rather than data.
 //
 // Example minimal deployment:
 //

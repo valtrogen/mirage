@@ -11,19 +11,14 @@ import (
 	"github.com/valtrogen/mirage/client"
 )
 
-// Dial opens a stream on conn, sends a TCP_CONNECT request for
+// Dial opens a stream on c, sends a TCP_CONNECT request for
 // (network, addr), and returns a net.Conn that bridges bytes through
 // the stream until either side closes.
 //
-// network must be "tcp", "tcp4", or "tcp6" — the proxy frame carries
+// network must be "tcp", "tcp4", or "tcp6"; the proxy frame carries
 // no AF distinction beyond the address literal, so all three behave
 // the same on the wire. addr is parsed with net.SplitHostPort.
-//
-// The returned net.Conn's LocalAddr is the local UDP address of the
-// mirage connection; RemoteAddr is a synthetic address that reports
-// the requested target. SetDeadline/SetReadDeadline/SetWriteDeadline
-// propagate to the underlying mirage stream.
-func Dial(ctx context.Context, conn *client.Conn, network, addr string) (net.Conn, error) {
+func Dial(ctx context.Context, c *client.Conn, network, addr string) (net.Conn, error) {
 	switch network {
 	case "tcp", "tcp4", "tcp6":
 	default:
@@ -33,7 +28,7 @@ func Dial(ctx context.Context, conn *client.Conn, network, addr string) (net.Con
 			Err: fmt.Errorf("mirage/proxy: unsupported network %q", network),
 		}
 	}
-	if conn == nil {
+	if c == nil {
 		return nil, errors.New("mirage/proxy: nil client.Conn")
 	}
 
@@ -46,7 +41,7 @@ func Dial(ctx context.Context, conn *client.Conn, network, addr string) (net.Con
 		return nil, &net.OpError{Op: "dial", Net: network, Err: fmt.Errorf("invalid port: %w", err)}
 	}
 
-	st, err := conn.OpenStream(ctx)
+	st, err := c.OpenStream(ctx)
 	if err != nil {
 		return nil, &net.OpError{Op: "dial", Net: network, Err: err}
 	}
@@ -74,14 +69,14 @@ func Dial(ctx context.Context, conn *client.Conn, network, addr string) (net.Con
 
 	return &streamConn{
 		stream: st,
-		local:  conn.LocalAddr(),
+		local:  c.LocalAddr(),
 		remote: targetAddr{network: network, addr: addr},
 	}, nil
 }
 
-// streamConn adapts a *client.Stream to net.Conn.
+// streamConn adapts a client.Stream to net.Conn.
 type streamConn struct {
-	stream *client.Stream
+	stream client.Stream
 	local  net.Addr
 	remote net.Addr
 }

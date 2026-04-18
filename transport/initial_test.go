@@ -69,6 +69,17 @@ func rfcInitialPacket(t *testing.T) []byte {
 	return b
 }
 
+// mustHex decodes a hex string and fails the test on error. Used by
+// the RFC 9001 vector assertions; kept private to the test file.
+func mustHex(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatalf("hex %q: %v", s, err)
+	}
+	return b
+}
+
 func TestParseInitialRFCVector(t *testing.T) {
 	pkt := rfcInitialPacket(t)
 	got, err := ParseInitial(pkt)
@@ -158,5 +169,99 @@ func TestExtractCRYPTODataStopsOnGap(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("want empty, got %q", got)
+	}
+}
+
+// TestExtractCRYPTODataShuffledChromeStyle exercises the layout uquic's
+// QUICRandomFrames builder produces for the Chrome H3 parrot: the
+// ClientHello is split across several CRYPTO frames at increasing
+// offsets and then the entire list (including PING + PADDING) is
+// shuffled. The dispatcher must still recover the original byte
+// stream.
+func TestExtractCRYPTODataShuffledChromeStyle(t *testing.T) {
+	hello := []byte("CLIENTHELLO-PAYLOAD-CHROMESTYLE-CRYPTO-DATA-1234567890")
+
+	// Build CRYPTO fragments for [0:10), [10:25), [25:len(hello)) but
+	// emit them in 2,0,1 order with PING and PADDING sprinkled in.
+	frag := func(off uint64, lo, hi int) []byte {
+		buf := []byte{0x06}
+		buf = AppendVarInt(buf, off)
+		buf = AppendVarInt(buf, uint64(hi-lo))
+		buf = append(buf, hello[lo:hi]...)
+		return buf
+	}
+
+	var payload []byte
+	payload = append(payload, 0x01) // PING
+	payload = append(payload, frag(25, 25, len(hello))...)
+	payload = append(payload, 0x00, 0x00, 0x00) // PADDING
+	payload = append(payload, frag(0, 0, 10)...)
+	payload = append(payload, 0x01) // PING
+	payload = append(payload, frag(10, 10, 25)...)
+	payload = append(payload, 0x00, 0x00) // trailing PADDING
+
+	got, err := ExtractCRYPTOData(payload)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !bytes.Equal(got, hello) {
+		t.Fatalf("reassembly mismatch:\n got=%q\nwant=%q", got, hello)
+	}
+}
+
+// TestExtractCRYPTODataDuplicateFragments confirms the reassembler
+// tolerates retransmitted CRYPTO fragments: an exact duplicate of
+// [10:25) before the canonical [10:25) must not corrupt the output.
+func TestExtractCRYPTODataDuplicateFragments(t *testing.T) {
+	hello := []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+	frag := func(off uint64, lo, hi int) []byte {
+		buf := []byte{0x06}
+		buf = AppendVarInt(buf, off)
+		buf = AppendVarInt(buf, uint64(hi-lo))
+		return append(buf, hello[lo:hi]...)
+	}
+
+	var payload []byte
+	payload = append(payload, frag(0, 0, 10)...)
+	payload = append(payload, frag(10, 10, 20)...)
+	payload = append(payload, frag(10, 10, 20)...) // dup
+	payload = append(payload, frag(20, 20, len(hello))...)
+
+	got, err := ExtractCRYPTOData(payload)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !bytes.Equal(got, hello) {
+		t.Fatalf("got %q want %q", got, hello)
+	}
+}
+
+// TestExtractCRYPTODataSkipsACK exercises the ACK skipping path: a
+// CRYPTO frame followed by an ACK and another CRYPTO frame must not
+// abort reassembly mid-stream.
+func TestExtractCRYPTODataSkipsACK(t *testing.T) {
+	frag := func(off uint64, b []byte) []byte {
+		buf := []byte{0x06}
+		buf = AppendVarInt(buf, off)
+		buf = AppendVarInt(buf, uint64(len(b)))
+		return append(buf, b...)
+	}
+
+	var payload []byte
+	payload = append(payload, frag(0, []byte("AAAA"))...)
+
+	// ACK frame: type=0x02, largest=10, delay=0, range count=0,
+	// first range=10. All single-byte varints.
+	payload = append(payload, 0x02, 0x0A, 0x00, 0x00, 0x0A)
+
+	payload = append(payload, frag(4, []byte("BBBB"))...)
+
+	got, err := ExtractCRYPTOData(payload)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if string(got) != "AAAABBBB" {
+		t.Fatalf("got %q want AAAABBBB", got)
 	}
 }

@@ -12,7 +12,9 @@ use the keywords from RFC 2119.
 2. Active probes that fail authentication are forwarded to a real CDN
    endpoint; the prober receives the real CDN's response.
 3. Stale-window replays are rejected without allocating QUIC state.
-4. Single-connection throughput stays at standard BBRv2 levels.
+4. Single-connection throughput tracks whatever congestion controller
+   the host QUIC stack ships, so long as that controller produces a
+   naturally oscillating cwnd profile (CUBIC, Reno, BBR, BBRv2 — see §6).
 5. The protocol depends only on the three interfaces in `adapter`.
 
 ## 2. Cryptographic Primitives
@@ -218,7 +220,7 @@ keyed by `(UserID, WindowID)`:
 
 | Property            | Value                                          |
 | ------------------- | ---------------------------------------------- |
-| Congestion control  | Standard BBRv2 only                            |
+| Congestion control  | Any standard, naturally oscillating CC (see §6.1) |
 | PING interval       | Match targeted Chrome release (~30 s)          |
 | PMTU schedule       | Match targeted Chrome release                  |
 | ACK delay           | Match targeted Chrome release                  |
@@ -226,12 +228,47 @@ keyed by `(UserID, WindowID)`:
 | SNI per connection  | Constant for the connection's lifetime         |
 | SNI across conns    | MAY rotate from the configured pool            |
 
-Aggressive congestion controllers (Brutal, BBR with constant pacing)
-MUST NOT be used: their flat-rate signature is the largest data-plane
-fingerprint that has burned previous-generation proxies.
-
 A reference set of constants per Chrome release lives in package
 `behavior`.
+
+### 6.1 Congestion control choice
+
+Implementations MUST use a congestion controller that produces a
+naturally oscillating, loss- or RTT-driven sending rate. The reference
+implementation uses whatever the host `quic-go` build ships (CUBIC at
+the time of writing); BBR and BBRv2 are equally acceptable.
+
+Aggressive controllers — Brutal, hard-coded constant-rate pacing,
+"infinity" cwnd — MUST NOT be used. Their flat-top throughput
+profile is the strongest single data-plane discriminator known to
+current censorship classifiers, and is a shape no real CDN flow
+ever produces.
+
+**Why a specific CC algorithm is not mandated:**
+
+1. The internet's HTTP/3 traffic is a mix. Chrome ships BBRv2 on
+   the client side, but server-side stacks differ widely: Cloudflare
+   `quiche` defaults to CUBIC, NGINX-QUIC and `nginx-quic` default to
+   CUBIC, LiteSpeed defaults to BBR, Microsoft `msquic` defaults to
+   CUBIC. The "natural" mirage flow lives in this multi-CC pool, not
+   in a single algorithmic signature.
+2. There is no published classifier that reliably separates
+   BBR/BBRv2 from CUBIC on a single connection's packet trace at
+   line rate. The classifiable shape is "Brutal vs everything else",
+   not "BBR vs CUBIC".
+3. Mandating one specific CC would couple mirage to a fork of
+   `quic-go` and create a new fingerprinting axis: any deployment
+   running an older mirage build would diverge from the spec, and
+   the mismatch itself becomes the fingerprint.
+4. The bottleneck cap that matters operationally — single-connection
+   throughput in the 200–300 MB/s range on a fast LAN, with sawtooth
+   loss recovery — is met by the default `quic-go` CUBIC and would
+   be met by BBRv2 as well.
+
+If a future deployment wants BBRv2 specifically (e.g., to match a
+specific CDN's server fingerprint as observed from a known vantage
+point), it MAY swap in any `quic-go`-compatible BBR implementation
+without touching the rest of mirage.
 
 ## 7. Control Stream
 

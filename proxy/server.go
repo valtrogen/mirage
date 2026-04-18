@@ -213,12 +213,11 @@ func (s *Server) handleStreamCore(
 	case CmdTCPConnect:
 		// fall through to TCP handler below
 	case CmdUDPAssociate:
-		if err := s.writeResponse(st, Response{Status: StatusOK}); err != nil {
-			s.Logger.Debug("proxy: write UDP OK response failed",
-				slog.String("err", err.Error()))
-			return
-		}
-		s.handleUDPAssociate(ctx, uid, st)
+		// UDP associate support was retired together with the
+		// custom client stack. Reject explicitly so callers see a
+		// clean error instead of a hang.
+		s.mBadRequest.Add(1)
+		s.writeResponse(st, Response{Status: StatusBadRequest, Reason: "udp associate not supported"})
 		return
 	default:
 		s.mBadRequest.Add(1)

@@ -1,0 +1,29 @@
+# This workflow was based on quic-go's unit.yml
+
+name: "Ginkgo Unit Tests"
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # os: [ "ubuntu-latest", "windows-latest", "macos-latest" ]
+        go: ["1.23.x", "1.24.x"]
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: go version
+
+      - name: Run unit tests
+        env:
+          TIMESCALE_FACTOR: 10
+        run: go run github.com/onsi/ginkgo/v2/ginkgo -r -v -cover -randomize-all -randomize-suites -trace -skip-package integrationtests
