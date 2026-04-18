@@ -132,9 +132,13 @@ func (s *Server) RotateMasterKeys(primary []byte, extras ...[]byte) error {
 }
 
 // DefaultAuthQueueDepth is the default capacity of the channel that
-// hands authenticated datagrams to the quic-go listener. 256 is enough
-// to absorb a typical handshake burst without significant memory cost.
-const DefaultAuthQueueDepth = 256
+// hands authenticated datagrams to the quic-go listener. 4096 absorbs
+// the bursts produced by a healthy mirage client uploading at line
+// rate (where one OpenStream can immediately spawn dozens of
+// MTU-sized packets) without blocking the dispatcher's read loop.
+// At ~1500 bytes per datagram the queue tops out at ~6 MiB, which is
+// negligible for a server process.
+const DefaultAuthQueueDepth = 4096
 
 // Conn is an accepted mirage QUIC connection together with the user
 // identity that authenticated it.

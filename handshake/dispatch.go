@@ -120,9 +120,16 @@ type Dispatcher struct {
 	once     sync.Once
 	stopCh   chan struct{}
 	drained  atomic.Bool
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	sessions *sessionLRU
 	limiter  *rateLimiter
+
+	// authQueueSampler counts authenticated datagrams so we only
+	// publish dispatcher.auth_queue_depth on every Nth one. The
+	// gauge underlying mAuthQueue takes an atomic write per call;
+	// at line-rate that overhead is visible in CPU profiles for no
+	// observability gain.
+	authQueueSampler atomic.Uint64
 
 	// Metric handles cached after init() so the hot path avoids map
 	// lookups on every datagram.
@@ -208,8 +215,8 @@ func (d *Dispatcher) Drain() {
 // SessionCount returns the number of cached 4-tuple entries. It is
 // intended for tests and operational metrics.
 func (d *Dispatcher) SessionCount() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	return d.sessions.Len()
 }
 
@@ -227,8 +234,8 @@ func (d *Dispatcher) OverflowCount() uint64 {
 // quic.Conn. The bool result is false when addr has no cached session
 // or the session is not in the auth state.
 func (d *Dispatcher) UserIDFor(addr net.Addr) (adapter.UserID, bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	s, ok := d.sessions.Get(addr.String(), false)
 	if !ok || s.Decision != DispatchAuth {
 		return adapter.UserID{}, false
@@ -304,9 +311,13 @@ func (d *Dispatcher) readLoop() {
 func (d *Dispatcher) dispatch(addr net.Addr, datagram []byte) {
 	key := addr.String()
 
-	d.mu.Lock()
-	sess, ok := d.sessions.Get(key, true)
-	d.mu.Unlock()
+	// Hot path: an already-classified 4-tuple needs only a read
+	// lock and skips the LRU touch. Eviction order falls back to
+	// insertion order, but the reaper uses the per-session atomic
+	// `last` timestamp anyway, so true LRU is unnecessary.
+	d.mu.RLock()
+	sess, ok := d.sessions.Get(key, false)
+	d.mu.RUnlock()
 
 	if ok {
 		sess.last.Store(time.Now().UnixNano())
@@ -346,7 +357,7 @@ func (d *Dispatcher) dispatch(addr net.Addr, datagram []byte) {
 	new.last.Store(time.Now().UnixNano())
 
 	d.mu.Lock()
-	if existing, ok := d.sessions.Get(key, true); ok {
+	if existing, ok := d.sessions.Get(key, false); ok {
 		// Lost a race; honor the existing entry.
 		new = existing
 	} else if evicted := d.sessions.Put(key, new); evicted != nil {
@@ -435,7 +446,12 @@ func (d *Dispatcher) deliverAuthAllowDrain(addr net.Addr, datagram []byte, uid a
 	dg := AuthDatagram{Data: datagram, RemoteAddr: addr, UserID: uid}
 	select {
 	case d.AuthSink <- dg:
-		d.mAuthQueue.Set(int64(len(d.AuthSink)))
+		// Sample the queue depth gauge once every 64 datagrams. The
+		// gauge is an instantaneous snapshot anyway; a tighter cadence
+		// only burns CPU on the hot path.
+		if d.authQueueSampler.Add(1)&63 == 0 {
+			d.mAuthQueue.Set(int64(len(d.AuthSink)))
+		}
 	case <-d.stopCh:
 	default:
 		d.mAuthOverflow.Add(1)
@@ -471,12 +487,17 @@ func (d *Dispatcher) reapLoop() {
 		case now := <-t.C:
 			cutoff := now.Add(-d.SessionTTL).UnixNano()
 			var stale []string
-			d.mu.Lock()
+			d.mu.RLock()
 			d.sessions.ForEach(func(k string, s *SessionState) {
 				if s.last.Load() < cutoff {
 					stale = append(stale, k)
 				}
 			})
+			d.mu.RUnlock()
+			if len(stale) == 0 {
+				continue
+			}
+			d.mu.Lock()
 			for _, k := range stale {
 				d.sessions.Delete(k)
 			}
